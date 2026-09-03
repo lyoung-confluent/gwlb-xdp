@@ -1,2 +1,2 @@
 # gwlb-xdp
-A PoC using XDP/eBPF to parse/redirect GENEVE traffic from an AWS Gateway Load Balancer (gwlb) into Linux network namespaces per VPCE
+A PoC using XDP/eBPF to parse/redirect GENEVE traffic to/from an [AWS Gateway Load Balancer](https://docs.aws.amazon.com/elasticloadbalancing/latest/gateway/introduction.html) (gwlb) into different [Linux network namespaces](https://man7.org/linux/man-pages/man7/network_namespaces.7.html) for each attached VPC endpoint. Essentially a kernel-mode implementation of [aws-gateway-load-balancer-tunnel-handler](https://github.com/aws-samples/aws-gateway-load-balancer-tunnel-handler).
