@@ -73,9 +73,9 @@ Two `.rodata` knobs set at `setup` fix behavior for the life of the loaded progr
 ## Usage
 
 ```
-gwlb-xdp setup <uplink-ifname>       # load decap+encap, attach decap to the uplink
-gwlb-xdp add <vpce-0000000aabbccddee>    # provision one ENI: netns + veth + attach encap
-gwlb-xdp remove <vpce-0000000aabbccddee> # reverse add
-gwlb-xdp teardown                    # reverse setup (and any remaining add's)
-gwlb-xdp metrics                     # serve BPF packet counters as Prometheus metrics
+gwlb-xdp setup <uplink-ifname>            # load decap+encap, attach decap to the uplink
+gwlb-xdp add <vpce-0000000aabbccddee>     # provision one ENI: netns + veth + attach encap
+gwlb-xdp remove <vpce-0000000aabbccddee>  # reverse add
+gwlb-xdp teardown                         # reverse setup (and any remaining add's)
+gwlb-xdp metrics                          # serve BPF packet counters as Prometheus metrics
 ```
