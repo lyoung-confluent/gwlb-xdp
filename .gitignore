@@ -8,6 +8,9 @@
 *.so
 *.dylib
 
+# Loader binary built by `make loader`
+/gwlb-xdp
+
 # Test binary, built with `go test -c`
 *.test
 
