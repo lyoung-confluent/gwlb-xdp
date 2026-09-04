@@ -7,30 +7,35 @@ A PoC using XDP/eBPF to parse/redirect GENEVE traffic to/from an [AWS Gateway Lo
 `gwlb-xdp` is a CLI ([main.go](main.go), commands in [cmd/](cmd)) that loads and wires up two XDP programs, then exits — packet processing happens entirely in the kernel, driven by nothing running in userspace. The programs and the maps they share are pinned under `/sys/fs/bpf/gwlb-xdp` ([bpf/maps.go](bpf/maps.go)) so they keep running (and can be found by later invocations of the CLI) after the loader process exits.
 
 ```
-                 physical uplink (one NIC, shared by every VPC endpoint)
-                          │
-                 GENEVE/UDP from GWLB
-                          ▼
-                 ┌──────────────────┐
-                 │   decap (XDP)    │  attached once, to the uplink
-                 └──────────────────┘
-                    │ reads eni_to_ifindex, writes flow_state
-                    │ bpf_redirect() to the matching veth-outer
-                    ▼
-   ┌────────────────────────────────────────────────┐
-   │ veth-outer (gwlb<base58 ENI id>, default netns) │
-   └────────────────────────────────────────────────┘
-                    │             ▲
-           ┌────────────────┐     │
-           │  encap (XDP)   │─────┘ bpf_redirect() back out the uplink
-           └────────────────┘   reads flow_state (cached outer header)
-                    ▲
-                    │ veth pair
-                    ▼
-   ┌────────────────────────────────────────────────┐
-   │  veth-inner (same name, inside vpce-... netns)  │  one per VPC endpoint
-   │            → appliance / backend traffic        │
-   └────────────────────────────────────────────────┘
++----------------------------------------------------------------+
+|   physical uplink (single NIC, shared by every VPC endpoint)   |
++----------------------------------------------------------------+
+                |                                 ^
+                | GENEVE/UDP from GWLB            | reply GENEVE/UDP to GWLB
+                v                                 |
++------------------------------+  +------------------------------+
+|         decap (XDP)          |  |         encap (XDP)          |
+|        attached once,        |  |      attached per ENI,       |
+|        on the uplink         |  |        on veth-outer         |
++------------------------------+  +------------------------------+
+                |                                 ^
+                | redirect via                    | redirect via
+                | eni_to_ifindex;                 | flow_state
+                | cache outer hdr                 | (cached outer
+                | in flow_state                   | hdr replayed)
+                v                                 |
++----------------------------------------------------------------+
+|        veth-outer (gwlb<base58 ENI id>, default netns)         |
++----------------------------------------------------------------+
+                |                                 ^
+                | veth pair                       |
+                | (crosses into                   |
+                | the ENI's netns)                |
+                v                                 |
++----------------------------------------------------------------+
+|         veth-inner (same name, inside vpce-... netns)          |
+|                 -> appliance / backend traffic                 |
++----------------------------------------------------------------+
 ```
 
 ### Two XDP programs, one shared cache
