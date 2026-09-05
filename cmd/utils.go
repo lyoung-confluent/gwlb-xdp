@@ -29,25 +29,56 @@ func FormatVPCEID(gwlbID uint64) string {
 	return fmt.Sprintf("vpce-%017x", gwlbID)
 }
 
-func FormatInterfaceName(gwlbID uint64) string {
-	var buf [8]byte
-	binary.BigEndian.PutUint64(buf[:], gwlbID)
-	return "gwlb" + base58.Encode(buf[:])
+// Interface name prefixes. A namespace-isolated ENI's veth-inner is safe to
+// give the exact same name as its veth-outer (gwlbPrefix) since the two live
+// in different netns; a --no-netns ENI keeps both ends in one netns and so
+// needs the direction-tagged prefixes instead. All three are 4 chars so that,
+// combined with the up-to-11-char base58 ID, names never exceed IFNAMSIZ-1
+// (15 chars) — see FormatInterfaceName.
+const (
+	gwlbPrefix       = "gwlb" // namespace-isolated: shared by both veth ends
+	gwlbOuterNoNetns = "gwlo" // --no-netns: veth-outer (root netns, decap/encap side)
+	gwlbInnerNoNetns = "gwli" // --no-netns: veth-inner (backend/appliance side)
+)
+
+// FormatInterfaceName returns the name of one end of gwlbID's veth pair.
+// isolated selects the naming scheme: true (namespace-isolated, the default)
+// gives both ends the same name — safe since they live in different netns —
+// so inner is ignored. false (--no-netns) keeps both ends in the root netns,
+// so inner picks which direction-tagged name to return.
+func FormatInterfaceName(gwlbID uint64, isolated, inner bool) string {
+	prefix := gwlbPrefix
+	if !isolated {
+		prefix = gwlbOuterNoNetns
+		if inner {
+			prefix = gwlbInnerNoNetns
+		}
+	}
+	return prefix + encodeGWLBID(gwlbID)
 }
 
-// ParseInterfaceName reverses FormatInterfaceName. ok is false if name
-// doesn't have the "gwlb" prefix or isn't a validly-encoded ID — e.g. a
-// physical interface's own name.
+func encodeGWLBID(gwlbID uint64) string {
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], gwlbID)
+	return base58.Encode(buf[:])
+}
+
+// ParseInterfaceName reverses FormatInterfaceName, recognizing all three
+// prefixes it can produce. ok is false if name doesn't have one of them or
+// isn't a validly-encoded ID — e.g. a physical interface's own name.
 func ParseInterfaceName(name string) (gwlbID uint64, ok bool) {
-	suffix, found := strings.CutPrefix(name, "gwlb")
-	if !found {
-		return 0, false
+	for _, prefix := range [...]string{gwlbPrefix, gwlbOuterNoNetns, gwlbInnerNoNetns} {
+		suffix, found := strings.CutPrefix(name, prefix)
+		if !found {
+			continue
+		}
+		buf, err := base58.Decode(suffix)
+		if err != nil || len(buf) != 8 {
+			return 0, false
+		}
+		return binary.BigEndian.Uint64(buf), true
 	}
-	buf, err := base58.Decode(suffix)
-	if err != nil || len(buf) != 8 {
-		return 0, false
-	}
-	return binary.BigEndian.Uint64(buf), true
+	return 0, false
 }
 
 // withLockedOSThread runs fn pinned to its OS thread, restoring the thread's

@@ -59,6 +59,8 @@ Each attached VPC endpoint (`vpce-...`) is provisioned independently at runtime 
 
 Namespacing each VPC endpoint this way means the appliance/backend logic behind each ENI runs in full network isolation from the others, while decap/encap — running once each, in the root context — do the actual per-ENI dispatch and caching using ifindex as the tenant key.
 
+`add --no-netns` skips the dedicated netns: both veth ends stay in the root netns instead, under distinct names (`gwlo<id>`/`gwli<id>` rather than the shared `gwlb<id>` — see `FormatInterfaceName` in [cmd/utils.go](cmd/utils.go)). This only makes sense when no two ENIs on the box have overlapping backend addressing, since without separate netns nothing keeps their routing tables apart — which is also why netns isolation is the default rather than an opt-in.
+
 ### Shared BPF state
 
 All maps live in [bpf/maps.h](bpf/maps.h) (`metrics`, `flow_state_v4` and `flow_state_v6`) and [bpf/decap/_decap.c](bpf/decap/_decap.c) (`eni_to_ifindex`), pinned by name so both programs' loads resolve to the same underlying map:
