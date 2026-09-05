@@ -67,7 +67,7 @@ All maps live in [bpf/maps.h](bpf/maps.h) (`metrics`, `flow_state_v4` and `flow_
 |---|---|
 | `eni_to_ifindex` | AWS ENI ID → veth-outer ifindex + synthesized L2 addressing. Sized by `--max-enis` at `setup`. |
 | `flow_state_v4` / `flow_state_v6` | Inner 5-tuple (+ ifindex) → cached outer header bytes, an LRU hash so old flows age out automatically. Disabling a family (`--max-flows-v4/v6 <=1`) shrinks its map to a 1-entry placeholder and sets a `.rodata` flag so both programs drop that family's traffic before touching the map. |
-| `metrics` | Per-(ifindex, counter) packet counts, per-CPU, exposed by `gwlb-xdp metrics` ([cmd/metrics.go](cmd/metrics.go)) as Prometheus counters. |
+| `metrics` | Per-(ifindex, counter) packet and byte counts, per-CPU, exposed by `gwlb-xdp metrics` ([cmd/metrics.go](cmd/metrics.go)) as Prometheus counters. |
 
 Two `.rodata` knobs set at `setup` fix behavior for the life of the loaded program rather than being looked up per packet: `eni_mode` (NAT/terminating vs. transparent-appliance reply orientation) and the uplink's own MAC/ifindex (so encap can address and redirect replies without a map lookup).
 

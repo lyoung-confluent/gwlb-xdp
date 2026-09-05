@@ -23,16 +23,26 @@ struct {
 } flow_state_v6 SEC(".maps");
 
 enum metric {
-	DECAP_CNT_PASS_NOT_GENEVE = 0,
-	DECAP_CNT_DROP_MALFORMED,
-	DECAP_CNT_DROP_UNKNOWN_ENI,
-	DECAP_CNT_DROP_HDR_TOO_LONG,
-	DECAP_CNT_DROP_FAMILY_DISABLED,
-	DECAP_CNT_OK,
-	ENCAP_CNT_DROP_MALFORMED,
-	ENCAP_CNT_DROP_FLOW_MISS,
-	ENCAP_CNT_DROP_FAMILY_DISABLED,
-	ENCAP_CNT_OK,
+	DECAP_CNT_PASS_NOT_GENEVE_PACKETS = 0,
+	DECAP_CNT_PASS_NOT_GENEVE_BYTES,
+	DECAP_CNT_DROP_MALFORMED_PACKETS,
+	DECAP_CNT_DROP_MALFORMED_BYTES,
+	DECAP_CNT_DROP_UNKNOWN_ENI_PACKETS,
+	DECAP_CNT_DROP_UNKNOWN_ENI_BYTES,
+	DECAP_CNT_DROP_HDR_TOO_LONG_PACKETS,
+	DECAP_CNT_DROP_HDR_TOO_LONG_BYTES,
+	DECAP_CNT_DROP_FAMILY_DISABLED_PACKETS,
+	DECAP_CNT_DROP_FAMILY_DISABLED_BYTES,
+	DECAP_CNT_OK_PACKETS,
+	DECAP_CNT_OK_BYTES,
+	ENCAP_CNT_DROP_MALFORMED_PACKETS,
+	ENCAP_CNT_DROP_MALFORMED_BYTES,
+	ENCAP_CNT_DROP_FLOW_MISS_PACKETS,
+	ENCAP_CNT_DROP_FLOW_MISS_BYTES,
+	ENCAP_CNT_DROP_FAMILY_DISABLED_PACKETS,
+	ENCAP_CNT_DROP_FAMILY_DISABLED_BYTES,
+	ENCAP_CNT_OK_PACKETS,
+	ENCAP_CNT_OK_BYTES,
 	__METRIC_MAX,
 };
 
@@ -50,7 +60,9 @@ struct {
 	__uint(map_flags, 0); /* shared by encap and decap */
 } metrics SEC(".maps");
 
-static __always_inline void increment_metric(__u32 ifindex, __u32 idx)
+/* amount is 1 for every packet-outcome counter, or a packet's byte length
+ * for a _BYTES counter. */
+static __always_inline void increment_metric(__u32 ifindex, __u32 idx, __u64 amount)
 {
 	struct metric_key key = { .ifindex = ifindex, .counter = idx };
 	__u64 *cnt = bpf_map_lookup_elem(&metrics, &key);
@@ -65,7 +77,7 @@ static __always_inline void increment_metric(__u32 ifindex, __u32 idx)
 		cnt = bpf_map_lookup_elem(&metrics, &key);
 	}
 	if (cnt)
-		__sync_fetch_and_add(cnt, 1);
+		__sync_fetch_and_add(cnt, amount);
 }
 
 #endif /* GWLB_XDP_MAPS_H */

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -76,7 +77,11 @@ func MetricsHandler(w http.ResponseWriter, r *http.Request) {
 
 	for _, name := range bpf.CounterNames {
 		metric := "gwlb_xdp_" + name + "_total"
-		fmt.Fprintf(w, "# HELP %s Packets counted by the gwlb-xdp BPF programs for the %q outcome, by originating interface and CPU. gwlb_id is added when that interface is one of this box's provisioned ENIs; decap events counted before an ENI is resolved are attributed to the uplink interface it's attached to.\n", metric, name)
+		unit := "Packets"
+		if strings.HasSuffix(name, "_bytes") {
+			unit = "Bytes"
+		}
+		fmt.Fprintf(w, "# HELP %s %s counted by the gwlb-xdp BPF programs for the %q outcome, by originating interface and CPU. gwlb_id is added when that interface is one of this box's provisioned ENIs; decap events counted before an ENI is resolved are attributed to the uplink interface it's attached to.\n", metric, unit, name)
 		fmt.Fprintf(w, "# TYPE %s counter\n", metric)
 		for _, e := range byName[name] {
 			for cpu, v := range e.PerCPU {

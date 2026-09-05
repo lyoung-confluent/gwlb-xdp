@@ -20,7 +20,8 @@
 	do { \
 		if ((c).len < (__u16)MIN_OUTER_HDR_BYTES || \
 		    (c).len > MAX_OUTER_HDR_BYTES) { \
-			increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED); \
+			increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED_PACKETS, 1); \
+			increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED_BYTES, frame_len); \
 			return XDP_DROP; \
 		} \
 	} while (0)
@@ -94,6 +95,12 @@ int encap(struct xdp_md *ctx)
 {
 	void *data = (void *)(long)ctx->data;
 	void *data_end = (void *)(long)ctx->data_end;
+	/* Captured once, from the frame as it arrived on this veth: every
+	 * _BYTES counter below uses this rather than re-deriving
+	 * data_end - data at its own site, so every outcome — drop or ok —
+	 * counts the same thing (bytes received on the veth), not whatever
+	 * size the buffer happens to be after the outer header's restored. */
+	__u32 frame_len = (__u32)((__u8 *)data_end - (__u8 *)data);
 
 	__u32 ifindex = ctx->ingress_ifindex;
 
@@ -105,7 +112,8 @@ int encap(struct xdp_md *ctx)
 
 	struct ethhdr *eth = data;
 	if ((void *)(eth + 1) > data_end) {
-		increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED);
+		increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED_PACKETS, 1);
+		increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 		return XDP_DROP;
 	}
 	/* Non-IP chatter on this veth (ARP, IPv6 ND, ...) is netns-internal,
@@ -122,7 +130,8 @@ int encap(struct xdp_md *ctx)
 	/* Family disabled at load time — drop before the shrunk flow_state
 	 * lookup. */
 	if ((is_v6 && !ipv6_enabled) || (!is_v6 && !ipv4_enabled)) {
-		increment_metric(ifindex, ENCAP_CNT_DROP_FAMILY_DISABLED);
+		increment_metric(ifindex, ENCAP_CNT_DROP_FAMILY_DISABLED_PACKETS, 1);
+		increment_metric(ifindex, ENCAP_CNT_DROP_FAMILY_DISABLED_BYTES, frame_len);
 		return XDP_DROP;
 	}
 
@@ -134,11 +143,13 @@ int encap(struct xdp_md *ctx)
 		struct iphdr *ip = (void *)(eth + 1);
 
 		if ((void *)(ip + 1) > data_end) {
-			increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED);
+			increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED_PACKETS, 1);
+			increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 			return XDP_DROP;
 		}
 		if (ip->ihl < 5) {
-			increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED);
+			increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED_PACKETS, 1);
+			increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 			return XDP_DROP;
 		}
 
@@ -147,7 +158,8 @@ int encap(struct xdp_md *ctx)
 			struct udphdr *l4hdr = (void *)l4;
 
 			if ((void *)(l4hdr + 1) > data_end) {
-				increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED);
+				increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED_PACKETS, 1);
+				increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 				return XDP_DROP;
 			}
 			sport = l4hdr->source;
@@ -172,7 +184,8 @@ int encap(struct xdp_md *ctx)
 		struct ipv6hdr *ip6 = (void *)(eth + 1);
 
 		if ((void *)(ip6 + 1) > data_end) {
-			increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED);
+			increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED_PACKETS, 1);
+			increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 			return XDP_DROP;
 		}
 		/* Extension headers aren't walked — see _decap.c. */
@@ -180,7 +193,8 @@ int encap(struct xdp_md *ctx)
 			struct udphdr *l4hdr = (void *)(ip6 + 1);
 
 			if ((void *)(l4hdr + 1) > data_end) {
-				increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED);
+				increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED_PACKETS, 1);
+				increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 				return XDP_DROP;
 			}
 			sport = l4hdr->source;
@@ -202,7 +216,8 @@ int encap(struct xdp_md *ctx)
 
 	if (!cache_p) {
 		/* Response for a flow this box never decapped. */
-		increment_metric(ifindex, ENCAP_CNT_DROP_FLOW_MISS);
+		increment_metric(ifindex, ENCAP_CNT_DROP_FLOW_MISS_PACKETS, 1);
+		increment_metric(ifindex, ENCAP_CNT_DROP_FLOW_MISS_BYTES, frame_len);
 		return XDP_DROP;
 	}
 	struct outer_hdr_cache cache = *cache_p; /* copy out before adjust_head */
@@ -212,7 +227,8 @@ int encap(struct xdp_md *ctx)
 	/* Drop the veth's L2 framing, reopen room for the cached outer header. */
 	int delta = (int)sizeof(struct ethhdr) - (int)cache.len;
 	if (bpf_xdp_adjust_head(ctx, delta)) {
-		increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED);
+		increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED_PACKETS, 1);
+		increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 		return XDP_DROP;
 	}
 
@@ -221,7 +237,8 @@ int encap(struct xdp_md *ctx)
 	REJECT_BAD_CACHE_LEN(cache);
 
 	if (bpf_xdp_store_bytes(ctx, 0, cache.hdr, cache.len)) {
-		increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED);
+		increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED_PACKETS, 1);
+		increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 		return XDP_DROP;
 	}
 
@@ -230,17 +247,20 @@ int encap(struct xdp_md *ctx)
 
 	struct ethhdr *new_eth = data;
 	if ((void *)(new_eth + 1) > data_end) {
-		increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED);
+		increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED_PACKETS, 1);
+		increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 		return XDP_DROP;
 	}
 	struct iphdr *new_ip = (void *)(new_eth + 1);
 	if ((void *)(new_ip + 1) > data_end) {
-		increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED);
+		increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED_PACKETS, 1);
+		increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 		return XDP_DROP;
 	}
 	struct udphdr *new_udp = (void *)(new_ip + 1);
 	if ((void *)(new_udp + 1) > data_end) {
-		increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED);
+		increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED_PACKETS, 1);
+		increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 		return XDP_DROP;
 	}
 
@@ -271,6 +291,7 @@ int encap(struct xdp_md *ctx)
 	 * so the netns egress path writes the real checksum before it reaches
 	 * encap — this redirect transmit never hits transmit-time offload.
 	 */
-	increment_metric(ifindex, ENCAP_CNT_OK);
+	increment_metric(ifindex, ENCAP_CNT_OK_PACKETS, 1);
+	increment_metric(ifindex, ENCAP_CNT_OK_BYTES, frame_len);
 	return bpf_redirect(uplink_ifindex, 0);
 }

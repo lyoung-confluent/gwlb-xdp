@@ -54,6 +54,12 @@ int decap(struct xdp_md *ctx)
 {
 	void *data_end = (void *)(long)ctx->data_end;
 	void *data = (void *)(long)ctx->data;
+	/* Captured once, from the frame as it arrived: every _BYTES counter
+	 * below uses this rather than re-deriving data_end - data at its own
+	 * site, so every outcome — drop, pass, or ok — counts the same thing
+	 * (bytes received on the uplink), not whatever size the buffer
+	 * happens to be after bpf_xdp_adjust_head has run. */
+	__u32 frame_len = (__u32)((__u8 *)data_end - (__u8 *)data);
 
 	/* The uplink decap is attached to. Counts pre-ENI events (not-GENEVE,
 	 * malformed, unknown-ENI) against the interface they arrived on, rather
@@ -77,30 +83,35 @@ int decap(struct xdp_md *ctx)
 	if ((void *)(udp + 1) > data_end)
 		return XDP_PASS;
 	if (udp->dest != bpf_htons(GENEVE_PORT)) {
-		increment_metric(ingress_ifindex, DECAP_CNT_PASS_NOT_GENEVE);
+		increment_metric(ingress_ifindex, DECAP_CNT_PASS_NOT_GENEVE_PACKETS, 1);
+		increment_metric(ingress_ifindex, DECAP_CNT_PASS_NOT_GENEVE_BYTES, frame_len);
 		return XDP_PASS;
 	}
 
 	struct gwlb_genevehdr *gnv = (void *)(udp + 1);
 	if ((void *)(gnv + 1) > data_end) {
-		increment_metric(ingress_ifindex, DECAP_CNT_DROP_MALFORMED);
+		increment_metric(ingress_ifindex, DECAP_CNT_DROP_MALFORMED_PACKETS, 1);
+		increment_metric(ingress_ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 		return XDP_DROP;
 	}
 	if (gnv->ver != 0) {
-		increment_metric(ingress_ifindex, DECAP_CNT_DROP_MALFORMED);
+		increment_metric(ingress_ifindex, DECAP_CNT_DROP_MALFORMED_PACKETS, 1);
+		increment_metric(ingress_ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 		return XDP_DROP;
 	}
 
 	__u32 opt_len = gnv->opt_len * 4;
 	if (opt_len > MAX_GENEVE_OPT_BYTES) {
-		increment_metric(ingress_ifindex, DECAP_CNT_DROP_HDR_TOO_LONG);
+		increment_metric(ingress_ifindex, DECAP_CNT_DROP_HDR_TOO_LONG_PACKETS, 1);
+		increment_metric(ingress_ifindex, DECAP_CNT_DROP_HDR_TOO_LONG_BYTES, frame_len);
 		return XDP_DROP;
 	}
 
 	__u8 *opt_start = (__u8 *)(gnv + 1);
 	__u8 *opt_end = opt_start + opt_len;
 	if ((void *)opt_end > data_end) {
-		increment_metric(ingress_ifindex, DECAP_CNT_DROP_MALFORMED);
+		increment_metric(ingress_ifindex, DECAP_CNT_DROP_MALFORMED_PACKETS, 1);
+		increment_metric(ingress_ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 		return XDP_DROP;
 	}
 
@@ -161,14 +172,16 @@ int decap(struct xdp_md *ctx)
 	(void)flow_cookie;
 
 	if (malformed || !have_eni) {
-		increment_metric(ingress_ifindex, DECAP_CNT_DROP_MALFORMED);
+		increment_metric(ingress_ifindex, DECAP_CNT_DROP_MALFORMED_PACKETS, 1);
+		increment_metric(ingress_ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 		return XDP_DROP;
 	}
 
 	struct eni_info *info = bpf_map_lookup_elem(&eni_to_ifindex, &eni_id);
 	if (!info) {
 		/* ENI not provisioned by the loader, or GWLB misdirected. */
-		increment_metric(ingress_ifindex, DECAP_CNT_DROP_UNKNOWN_ENI);
+		increment_metric(ingress_ifindex, DECAP_CNT_DROP_UNKNOWN_ENI_PACKETS, 1);
+		increment_metric(ingress_ifindex, DECAP_CNT_DROP_UNKNOWN_ENI_BYTES, frame_len);
 		return XDP_DROP;
 	}
 	__u32 ifindex = info->ifindex;
@@ -185,14 +198,16 @@ int decap(struct xdp_md *ctx)
 	else if (inner_ethertype == ETH_P_IPV6)
 		inner_is_v6 = true;
 	else {
-		increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED);
+		increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_PACKETS, 1);
+		increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 		return XDP_DROP;
 	}
 
 	/* Family disabled at load time — drop before touching its shrunk
 	 * flow_state map. */
 	if ((inner_is_v6 && !ipv6_enabled) || (!inner_is_v6 && !ipv4_enabled)) {
-		increment_metric(ifindex, DECAP_CNT_DROP_FAMILY_DISABLED);
+		increment_metric(ifindex, DECAP_CNT_DROP_FAMILY_DISABLED_PACKETS, 1);
+		increment_metric(ifindex, DECAP_CNT_DROP_FAMILY_DISABLED_BYTES, frame_len);
 		return XDP_DROP;
 	}
 
@@ -208,11 +223,13 @@ int decap(struct xdp_md *ctx)
 		struct iphdr *inner_ip = (void *)opt_end;
 
 		if ((void *)(inner_ip + 1) > data_end) {
-			increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED);
+			increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_PACKETS, 1);
+			increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 			return XDP_DROP;
 		}
 		if (inner_ip->ihl < 5) {
-			increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED);
+			increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_PACKETS, 1);
+			increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 			return XDP_DROP;
 		}
 
@@ -223,7 +240,8 @@ int decap(struct xdp_md *ctx)
 			struct udphdr *l4hdr = (void *)l4;
 
 			if ((void *)(l4hdr + 1) > data_end) {
-				increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED);
+				increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_PACKETS, 1);
+				increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 				return XDP_DROP;
 			}
 			inner_sport = l4hdr->source;
@@ -237,7 +255,8 @@ int decap(struct xdp_md *ctx)
 		struct ipv6hdr *inner_ip6 = (void *)opt_end;
 
 		if ((void *)(inner_ip6 + 1) > data_end) {
-			increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED);
+			increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_PACKETS, 1);
+			increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 			return XDP_DROP;
 		}
 		/* Extension headers aren't walked: for GWLB traffic L4 sits
@@ -246,7 +265,8 @@ int decap(struct xdp_md *ctx)
 			struct udphdr *l4hdr = (void *)(inner_ip6 + 1);
 
 			if ((void *)(l4hdr + 1) > data_end) {
-				increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED);
+				increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_PACKETS, 1);
+				increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 				return XDP_DROP;
 			}
 			inner_sport = l4hdr->source;
@@ -281,7 +301,8 @@ int decap(struct xdp_md *ctx)
 			  opt_len;
 	if (outer_len > MAX_OUTER_HDR_BYTES) {
 		/* Unreachable given the opt_len cap, but the verifier needs it. */
-		increment_metric(ifindex, DECAP_CNT_DROP_HDR_TOO_LONG);
+		increment_metric(ifindex, DECAP_CNT_DROP_HDR_TOO_LONG_PACKETS, 1);
+		increment_metric(ifindex, DECAP_CNT_DROP_HDR_TOO_LONG_BYTES, frame_len);
 		return XDP_DROP;
 	}
 
@@ -289,7 +310,8 @@ int decap(struct xdp_md *ctx)
 	__builtin_memset(&cache, 0, sizeof(cache));
 	cache.len = (__u16)outer_len;
 	if (bpf_xdp_load_bytes(ctx, 0, cache.hdr, outer_len)) {
-		increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED);
+		increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_PACKETS, 1);
+		increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 		return XDP_DROP;
 	}
 
@@ -301,7 +323,8 @@ int decap(struct xdp_md *ctx)
 	/* Strip everything through the GENEVE options, then reopen room for a
 	 * synthesized L2 header, leaving [new eth hdr][inner IP packet]. */
 	if (bpf_xdp_adjust_head(ctx, (int)(outer_len - sizeof(struct ethhdr)))) {
-		increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED);
+		increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_PACKETS, 1);
+		increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 		return XDP_DROP;
 	}
 
@@ -309,13 +332,15 @@ int decap(struct xdp_md *ctx)
 	data_end = (void *)(long)ctx->data_end;
 	struct ethhdr *new_eth = data;
 	if ((void *)(new_eth + 1) > data_end) {
-		increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED);
+		increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_PACKETS, 1);
+		increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 		return XDP_DROP;
 	}
 	__builtin_memcpy(new_eth->h_dest, info->dst, 6);
 	__builtin_memcpy(new_eth->h_source, info->src, 6);
 	new_eth->h_proto = inner_proto_be;
 
-	increment_metric(ifindex, DECAP_CNT_OK);
+	increment_metric(ifindex, DECAP_CNT_OK_PACKETS, 1);
+	increment_metric(ifindex, DECAP_CNT_OK_BYTES, frame_len);
 	return bpf_redirect(ifindex, 0);
 }

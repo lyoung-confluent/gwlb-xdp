@@ -37,16 +37,26 @@ func RemovePinDir() error {
 // enum value is the Counter field of metricKey, so this slice's order must
 // track the enum exactly.
 var CounterNames = []string{
-	"decap_pass_not_geneve",
-	"decap_drop_malformed",
-	"decap_drop_unknown_eni",
-	"decap_drop_hdr_too_long",
-	"decap_drop_family_disabled",
-	"decap_ok",
-	"encap_drop_malformed",
-	"encap_drop_flow_miss",
-	"encap_drop_family_disabled",
-	"encap_ok",
+	"decap_pass_not_geneve_packets",
+	"decap_pass_not_geneve_bytes",
+	"decap_drop_malformed_packets",
+	"decap_drop_malformed_bytes",
+	"decap_drop_unknown_eni_packets",
+	"decap_drop_unknown_eni_bytes",
+	"decap_drop_hdr_too_long_packets",
+	"decap_drop_hdr_too_long_bytes",
+	"decap_drop_family_disabled_packets",
+	"decap_drop_family_disabled_bytes",
+	"decap_ok_packets",
+	"decap_ok_bytes",
+	"encap_drop_malformed_packets",
+	"encap_drop_malformed_bytes",
+	"encap_drop_flow_miss_packets",
+	"encap_drop_flow_miss_bytes",
+	"encap_drop_family_disabled_packets",
+	"encap_drop_family_disabled_bytes",
+	"encap_ok_packets",
+	"encap_ok_bytes",
 }
 
 // Metric is one interface's row for a counter: Ifindex identifies the
