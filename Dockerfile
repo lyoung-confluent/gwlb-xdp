@@ -7,7 +7,7 @@ ENTRYPOINT []
 # ---- build: compile the static loader from the checked-in bindings. Runs on
 # the builder's native platform and cross-compiles via GOOS/GOARCH — Go's
 # cross-compilation needs no emulation, unlike running the target arch itself.
-FROM --platform=$BUILDPLATFORM cgr.dev/chainguard/go AS build
+FROM --platform=$BUILDPLATFORM cgr.dev/chainguard/go:latest-dev AS build
 ARG TARGETOS
 ARG TARGETARCH
 WORKDIR /src
@@ -18,5 +18,5 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags=
 
 # ---- final: the static CGO-free binary on scratch.
 FROM scratch AS final
-COPY --from=build /out/gwlb-xdp /usr/local/bin/gwlb-xdp
-ENTRYPOINT ["/usr/local/bin/gwlb-xdp"]
+COPY --from=build /out/gwlb-xdp /gwlb-xdp
+ENTRYPOINT ["/gwlb-xdp"]
