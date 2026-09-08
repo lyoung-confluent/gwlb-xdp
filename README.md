@@ -77,6 +77,16 @@ Two `.rodata` knobs set at `setup` fix behavior for the life of the loaded progr
 
 [Dockerfile](Dockerfile) has three stages: `dev` (clang/llvm/libbpf/bpftool, used by `make generate` and `make verify` to rebuild the checked-in BPF objects and sanity-check them against the kernel verifier), `build` (compiles the static, CGO-free Go binary against the checked-in bindings — no BPF toolchain needed), and `final` (just that binary on `scratch`). Normal iteration only needs `go build`; the dev container is for regenerating or verifying the BPF side after editing `_decap.c`/`_encap.c`.
 
+### End-to-end test
+
+[test/e2e](test/e2e) exercises decap and encap together without a real GWLB: it synthesizes an AWS GWLB GENEVE packet and sends it into a veth pair standing in for the physical uplink, lets `setup`/`add`'s real veths, netns and a UDP echo server (standing in for the backend) carry it end to end, and checks the GENEVE reply that comes back — verbatim outer-header replay, swapped addressing, and the echoed payload all included. It needs real netns/veth/XDP support (`CAP_NET_ADMIN`/`CAP_SYS_ADMIN`/`CAP_BPF`), so run it via:
+
+```
+make e2e
+```
+
+which runs it inside the same `--privileged` dev container `make verify` uses — this works both locally (Docker Desktop's Linux VM has everything needed) and in CI ([.github/workflows/e2e.yml](.github/workflows/e2e.yml)).
+
 ## Usage
 
 ```

@@ -1,7 +1,7 @@
 IMAGE    := gwlb-xdp-dev
 PLATFORM ?= linux/$(shell uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
 
-.PHONY: all generate loader verify clean docker-build docker-shell docker-image
+.PHONY: all generate loader verify e2e clean docker-build docker-shell docker-image
 
 all: loader
 
@@ -10,6 +10,15 @@ generate: docker-build
 
 loader: docker-build
 	docker run --rm --platform=$(PLATFORM) -v $(CURDIR):/work $(IMAGE) go build -o gwlb-xdp .
+
+# End-to-end test (test/e2e): synthesizes a GWLB GENEVE packet and pushes it
+# through real decap/encap XDP programs, veths, netns and a UDP echo server —
+# no real GWLB involved. Needs real netns/veth/XDP support (CAP_NET_ADMIN,
+# CAP_SYS_ADMIN, CAP_BPF), hence --privileged, same as `verify` below.
+e2e: docker-build
+	docker run --rm --privileged --platform=$(PLATFORM) -v $(CURDIR):/work $(IMAGE) sh -euc '\
+		mount -t bpf bpf /sys/fs/bpf 2>/dev/null || true; \
+		go test -tags e2e -count=1 -v ./test/e2e/...'
 
 verify: docker-build
 	docker run --rm --privileged --platform=$(PLATFORM) -v $(CURDIR):/work $(IMAGE) sh -euc '\
