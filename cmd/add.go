@@ -179,6 +179,14 @@ func RunAdd(vpceID string, scriptPath string, isolated bool) (err error) {
 		return err
 	}
 
+	// Re-fetch rather than trusting the snapshot from the LinkByName call
+	// above: bringing the link up and/or the ethtool change can change the
+	// interface's hardware address on some drivers, and decap needs the MAC
+	// that's actually live on the wire.
+	inner, err = nsh.LinkByName(innerName)
+	if err != nil {
+		return fmt.Errorf("(*netlink.Handle).LinkByName for %q failed: %w", innerName, err)
+	}
 	mac := inner.Attrs().HardwareAddr
 	if len(mac) == 0 {
 		return fmt.Errorf("inner interface %s has no hardware address", innerName)
