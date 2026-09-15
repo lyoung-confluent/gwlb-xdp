@@ -39,10 +39,10 @@ func init() {
 }
 
 // RunAdd provisions one ENI's veth pair. When isolated, the veth-inner peer
-// moves into a dedicated netns named vpceID (the normal case); when not, both
-// ends stay in the root netns under distinct names (see FormatInterfaceName)
-// — only safe when no other ENI on this box has overlapping backend
-// addressing, since nothing then separates their routing tables.
+// moves into a dedicated netns named vpceID (the normal case); when not, it
+// stays alongside veth-outer in the root netns — only safe when no other ENI
+// on this box has overlapping backend addressing, since nothing then
+// separates their routing tables.
 func RunAdd(vpceID string, scriptPath string, isolated bool) (err error) {
 	if scriptPath != "" {
 		if _, err := os.Stat(scriptPath); err != nil {
@@ -55,8 +55,8 @@ func RunAdd(vpceID string, scriptPath string, isolated bool) (err error) {
 		return fmt.Errorf("ParseVPCEID for %q failed: %w", vpceID, err)
 	}
 
-	outerName := FormatInterfaceName(gwlbID, isolated, false)
-	innerName := FormatInterfaceName(gwlbID, isolated, true)
+	outerName := FormatInterfaceName(gwlbID, false)
+	innerName := FormatInterfaceName(gwlbID, true)
 
 	var newns netns.NsHandle
 	var nsh *netlink.Handle
@@ -98,43 +98,26 @@ func RunAdd(vpceID string, scriptPath string, isolated bool) (err error) {
 	// MTU 9001 (jumbo): the decapped inner packet can be nearly the full
 	// 8568-byte GENEVE payload, and veth forwarding silently drops over-MTU
 	// frames.
-	if isolated {
-		// The peer can't be created with its final name directly: it's
-		// created in the root netns like the outer end, then migrated, so it
-		// needs a placeholder name until the migration and rename below.
-		peerTmp := fmt.Sprintf("gwlb-tmp%d", os.Getpid())
-		if err := netlink.LinkAdd(&netlink.Veth{
-			LinkAttrs: netlink.LinkAttrs{Name: outerName, MTU: 9001},
-			PeerName:  peerTmp,
-			PeerMTU:   9001,
-		}); err != nil {
-			return fmt.Errorf("netlink.LinkAdd for veth pair %s/%s failed: %w", outerName, peerTmp, err)
-		}
+	//
+	// Both ends already have their final, distinct names (outer and inner
+	// never collide, isolated or not), so they're created in place in the
+	// root netns with no rename needed — isolated just additionally migrates
+	// the inner end into its dedicated netns afterwards.
+	if err := netlink.LinkAdd(&netlink.Veth{
+		LinkAttrs: netlink.LinkAttrs{Name: outerName, MTU: 9001},
+		PeerName:  innerName,
+		PeerMTU:   9001,
+	}); err != nil {
+		return fmt.Errorf("netlink.LinkAdd for veth pair %s/%s failed: %w", outerName, innerName, err)
+	}
 
-		peer, err := netlink.LinkByName(peerTmp)
+	if isolated {
+		peer, err := netlink.LinkByName(innerName)
 		if err != nil {
-			return fmt.Errorf("netlink.LinkByName for %q failed: %w", peerTmp, err)
+			return fmt.Errorf("netlink.LinkByName for %q failed: %w", innerName, err)
 		}
 		if err := netlink.LinkSetNsFd(peer, int(newns)); err != nil {
-			return fmt.Errorf("netlink.LinkSetNsFd for %q into netns %s failed: %w", peerTmp, vpceID, err)
-		}
-
-		peerInNetns, err := nsh.LinkByName(peerTmp)
-		if err != nil {
-			return fmt.Errorf("(*netlink.Handle).LinkByName for %q in netns %s failed: %w", peerTmp, vpceID, err)
-		}
-		if err := nsh.LinkSetName(peerInNetns, innerName); err != nil {
-			return fmt.Errorf("(*netlink.Handle).LinkSetName for %q to %q in netns %s failed: %w", peerTmp, innerName, vpceID, err)
-		}
-	} else {
-		// Both ends already have their final, distinct names, so there's no
-		// migration or rename to do — they're created in place.
-		if err := netlink.LinkAdd(&netlink.Veth{
-			LinkAttrs: netlink.LinkAttrs{Name: outerName, MTU: 9001},
-			PeerName:  innerName,
-			PeerMTU:   9001,
-		}); err != nil {
-			return fmt.Errorf("netlink.LinkAdd for veth pair %s/%s failed: %w", outerName, innerName, err)
+			return fmt.Errorf("netlink.LinkSetNsFd for %q into netns %s failed: %w", innerName, vpceID, err)
 		}
 	}
 

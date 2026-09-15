@@ -29,8 +29,8 @@ func init() {
 
 // RunRemove doesn't need to know whether the ENI was added with --no-netns:
 // the outer veth is found by ifindex (from the BPF map, when present) or by
-// trying every naming scheme add could have used, rather than by
-// reconstructing a name that depends on the mode.
+// its name, which — unlike the netns it and its peer end up in — doesn't
+// depend on the mode.
 func RunRemove(vpceID string) error {
 	gwlbID, err := ParseVPCEID(vpceID)
 	if err != nil {
@@ -58,14 +58,13 @@ func RunRemove(vpceID string) error {
 		}
 	} else {
 		// No map entry to read an ifindex from (e.g. a repeated remove, or
-		// the ENI was never provisioned) — fall back to name-based lookup
-		// across every naming scheme add could have used, so any leftover
-		// veth still gets cleaned up.
-		for _, ifname := range []string{FormatInterfaceName(gwlbID, true, false), FormatInterfaceName(gwlbID, false, false)} {
-			if link, err := netlink.LinkByName(ifname); err == nil {
-				if err := netlink.LinkDel(link); err != nil {
-					errs = append(errs, fmt.Errorf("netlink.LinkDel for %q failed: %w", ifname, err))
-				}
+		// the ENI was never provisioned) — fall back to the outer end's name
+		// (the same regardless of --no-netns) so any leftover veth still gets
+		// cleaned up.
+		ifname := FormatInterfaceName(gwlbID, false)
+		if link, err := netlink.LinkByName(ifname); err == nil {
+			if err := netlink.LinkDel(link); err != nil {
+				errs = append(errs, fmt.Errorf("netlink.LinkDel for %q failed: %w", ifname, err))
 			}
 		}
 	}

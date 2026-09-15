@@ -165,8 +165,8 @@ func provisionENI(t *testing.T, gwlbID uint64, isolated bool, echoIP string, ech
 	// decap_ok/encap_ok are keyed by (both are post-ENI-resolution
 	// counters — see _decap.c/_encap.c), as opposed to the uplink's own
 	// ifindex the pre-ENI drop counters use.
-	outerName := cmd.FormatInterfaceName(gwlbID, isolated, false)
-	innerName := cmd.FormatInterfaceName(gwlbID, isolated, true)
+	outerName := cmd.FormatInterfaceName(gwlbID, false)
+	innerName := cmd.FormatInterfaceName(gwlbID, true)
 	outerIface, err := net.InterfaceByName(outerName)
 	if err != nil {
 		t.Fatalf("net.InterfaceByName(%q) failed: %v", outerName, err)

@@ -25,7 +25,7 @@ A PoC using XDP/eBPF to parse/redirect GENEVE traffic to/from an [AWS Gateway Lo
                 | in flow_state                   | hdr replayed)
                 v                                 |
 +----------------------------------------------------------------+
-|        veth-outer (gwlb<base58 ENI id>, default netns)         |
+|        veth-outer (gxdp<base58 ENI id>, default netns)         |
 +----------------------------------------------------------------+
                 |                                 ^
                 | veth pair                       |
@@ -33,7 +33,7 @@ A PoC using XDP/eBPF to parse/redirect GENEVE traffic to/from an [AWS Gateway Lo
                 | the ENI's netns)                |
                 v                                 |
 +----------------------------------------------------------------+
-|         veth-inner (same name, inside vpce-... netns)          |
+|    veth-inner (gwlb<base58 ENI id>, inside vpce-... netns)     |
 |                 -> appliance / backend traffic                 |
 +----------------------------------------------------------------+
 ```
@@ -50,7 +50,7 @@ Both programs are compiled from C to CO-RE-free BPF object code by [bpf2go](http
 Each attached VPC endpoint (`vpce-...`) is provisioned independently at runtime with `gwlb-xdp add <vpce-id>` ([cmd/add.go](cmd/add.go)):
 
 1. Create a named network namespace for the VPC endpoint.
-2. Create a veth pair; move one end into the new netns and rename both ends to a name derived from the AWS ENI ID (`FormatInterfaceName` in [cmd/utils.go](cmd/utils.go), a `gwlb` prefix plus the ID base58-encoded).
+2. Create a veth pair, both ends named from the AWS ENI ID (`FormatInterfaceName` in [cmd/utils.go](cmd/utils.go)) — `gxdp<id>` for the outer end, `gwlb<id>` for the inner — and move the inner end into the new netns.
 3. Disable TX checksum offload on the inner veth, since BPF can't compute the real L4 checksum for the netns's egress traffic — the kernel must write it before encap ever sees the packet.
 4. Optionally run a `--script` hook (netns name + interface name as args) so the backend/appliance side can finish its own setup before the ENI is reachable.
 5. Insert `(ENI ID → outer ifindex, inner MAC, outer MAC)` into `eni_to_ifindex` and attach the shared `encap` program to the veth-outer — this is the last step, since it's what makes the ENI live.
@@ -59,7 +59,7 @@ Each attached VPC endpoint (`vpce-...`) is provisioned independently at runtime 
 
 Namespacing each VPC endpoint this way means the appliance/backend logic behind each ENI runs in full network isolation from the others, while decap/encap — running once each, in the root context — do the actual per-ENI dispatch and caching using ifindex as the tenant key.
 
-`add --no-netns` skips the dedicated netns: both veth ends stay in the root netns instead, under distinct names (`gwlo<id>`/`gwli<id>` rather than the shared `gwlb<id>` — see `FormatInterfaceName` in [cmd/utils.go](cmd/utils.go)). This only makes sense when no two ENIs on the box have overlapping backend addressing, since without separate netns nothing keeps their routing tables apart — which is also why netns isolation is the default rather than an opt-in.
+`add --no-netns` skips the dedicated netns: the inner end (`gwlb<id>`) stays in the root netns alongside the outer end (`gxdp<id>`) instead of migrating — the naming is the same either way (see `FormatInterfaceName` in [cmd/utils.go](cmd/utils.go)). This only makes sense when no two ENIs on the box have overlapping backend addressing, since without separate netns nothing keeps their routing tables apart — which is also why netns isolation is the default rather than an opt-in.
 
 ### Shared BPF state
 

@@ -29,30 +29,25 @@ func FormatVPCEID(gwlbID uint64) string {
 	return fmt.Sprintf("vpce-%017x", gwlbID)
 }
 
-// Interface name prefixes. A namespace-isolated ENI's veth-inner is safe to
-// give the exact same name as its veth-outer (gwlbPrefix) since the two live
-// in different netns; a --no-netns ENI keeps both ends in one netns and so
-// needs the direction-tagged prefixes instead. All three are 4 chars so that,
+// Interface name prefixes, the same in both isolated and --no-netns modes:
+// gwlbPrefix names the inner end — the one the backend/appliance actually
+// sends and receives on — and gxdpPrefix names the outer end, which only
+// decap/encap ever touch by name (or ifindex). Both are 4 chars so that,
 // combined with the up-to-11-char base58 ID, names never exceed IFNAMSIZ-1
 // (15 chars) — see FormatInterfaceName.
 const (
-	gwlbPrefix       = "gwlb" // namespace-isolated: shared by both veth ends
-	gwlbOuterNoNetns = "gwlo" // --no-netns: veth-outer (root netns, decap/encap side)
-	gwlbInnerNoNetns = "gwli" // --no-netns: veth-inner (backend/appliance side)
+	gwlbPrefix = "gwlb" // veth-inner: backend/appliance side
+	gxdpPrefix = "gxdp" // veth-outer: decap/encap side
 )
 
 // FormatInterfaceName returns the name of one end of gwlbID's veth pair.
-// isolated selects the naming scheme: true (namespace-isolated, the default)
-// gives both ends the same name — safe since they live in different netns —
-// so inner is ignored. false (--no-netns) keeps both ends in the root netns,
-// so inner picks which direction-tagged name to return.
-func FormatInterfaceName(gwlbID uint64, isolated, inner bool) string {
-	prefix := gwlbPrefix
-	if !isolated {
-		prefix = gwlbOuterNoNetns
-		if inner {
-			prefix = gwlbInnerNoNetns
-		}
+// inner selects which end: true for the backend/appliance-facing end, false
+// for the decap/encap-facing end. The naming doesn't depend on whether the
+// ENI is namespace-isolated — only which netns the inner end ends up in does.
+func FormatInterfaceName(gwlbID uint64, inner bool) string {
+	prefix := gxdpPrefix
+	if inner {
+		prefix = gwlbPrefix
 	}
 	return prefix + encodeGWLBID(gwlbID)
 }
@@ -63,11 +58,11 @@ func encodeGWLBID(gwlbID uint64) string {
 	return base58.Encode(buf[:])
 }
 
-// ParseInterfaceName reverses FormatInterfaceName, recognizing all three
-// prefixes it can produce. ok is false if name doesn't have one of them or
-// isn't a validly-encoded ID — e.g. a physical interface's own name.
+// ParseInterfaceName reverses FormatInterfaceName, recognizing both prefixes
+// it can produce. ok is false if name doesn't have one of them or isn't a
+// validly-encoded ID — e.g. a physical interface's own name.
 func ParseInterfaceName(name string) (gwlbID uint64, ok bool) {
-	for _, prefix := range [...]string{gwlbPrefix, gwlbOuterNoNetns, gwlbInnerNoNetns} {
+	for _, prefix := range [...]string{gwlbPrefix, gxdpPrefix} {
 		suffix, found := strings.CutPrefix(name, prefix)
 		if !found {
 			continue
