@@ -79,7 +79,7 @@ Two `.rodata` knobs set at `setup` fix behavior for the life of the loaded progr
 
 ### End-to-end test
 
-[test/e2e](test/e2e) exercises decap and encap together without a real GWLB: it synthesizes an AWS GWLB GENEVE packet and sends it into a veth pair standing in for the physical uplink, lets `setup`/`add`'s real veths, netns and a UDP echo server (standing in for the backend) carry it end to end, and checks the GENEVE reply that comes back — verbatim outer-header replay, swapped addressing, and the echoed payload all included. It needs real netns/veth/XDP support (`CAP_NET_ADMIN`/`CAP_SYS_ADMIN`/`CAP_BPF`), so run it via:
+[test/e2e](test/e2e) exercises decap and encap together without a real GWLB: it synthesizes an AWS GWLB GENEVE packet and sends it into a veth pair standing in for the physical uplink, lets `setup`/`add`'s real veths, netns and a UDP echo server (standing in for the backend) carry it end to end, and checks the GENEVE reply that comes back — verbatim outer-header replay, swapped addressing, and the echoed payload all included. A separate ICMP test (`TestICMPEcho`) checks the same round trip for a ping instead of UDP, needing no backend server at all — the kernel answers an echo request addressed to one of its own interfaces on its own. It needs real netns/veth/XDP support (`CAP_NET_ADMIN`/`CAP_SYS_ADMIN`/`CAP_BPF`), so run it via:
 
 ```
 make e2e

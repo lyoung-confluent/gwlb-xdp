@@ -56,6 +56,30 @@ func buildGeneveOptions(eniID, attachmentID uint64, flowCookie uint32) []*layers
 	}
 }
 
+// buildInnerICMPEchoRequest serializes an inner IPv4/ICMPv4 echo request —
+// pass it as requestParams.innerPacket to exercise decap/encap's ICMP
+// support (parse_l4_ports in bpf/geneve_defs.h), which keys the flow by the
+// echo's own id the way UDP keys by port.
+func buildInnerICMPEchoRequest(srcIP, dstIP net.IP, id, seq uint16, payload []byte) ([]byte, error) {
+	innerIP := &layers.IPv4{
+		Version:  4,
+		TTL:      64,
+		Protocol: layers.IPProtocolICMPv4,
+		SrcIP:    srcIP,
+		DstIP:    dstIP,
+	}
+	icmp := &layers.ICMPv4{
+		TypeCode: layers.CreateICMPv4TypeCode(layers.ICMPv4TypeEchoRequest, 0),
+		Id:       id,
+		Seq:      seq,
+	}
+	buf := gopacket.NewSerializeBuffer()
+	if err := gopacket.SerializeLayers(buf, serializeOpts, innerIP, icmp, gopacket.Payload(payload)); err != nil {
+		return nil, fmt.Errorf("serializing inner ICMP echo request failed: %w", err)
+	}
+	return append([]byte(nil), buf.Bytes()...), nil
+}
+
 // verifyIPChecksum reports whether hdr — a raw IPv4 header, checksum field
 // included as transmitted — is internally consistent: per RFC 1071, summing
 // every 16-bit word of a header over its own correct checksum folds to all
@@ -86,32 +110,43 @@ type requestParams struct {
 	innerSrcIP, innerDstIP     net.IP
 	innerSrcPort, innerDstPort uint16
 	payload                    []byte
+
+	// innerPacket, when set, is used verbatim as the GENEVE payload instead
+	// of building an inner IPv4/UDP packet from the innerSrcIP/innerDstIP/
+	// innerSrcPort/innerDstPort/payload fields above — for a non-UDP inner
+	// protocol, e.g. buildInnerICMPEchoRequest for the ICMP support test.
+	innerPacket []byte
 }
 
 // buildRequestFrame assembles a full Ethernet frame carrying an outer
-// IPv4/UDP/GENEVE tunnel around an inner IPv4/UDP packet, matching exactly
-// what decap (bpf/decap/_decap.c) expects to parse.
+// IPv4/UDP/GENEVE tunnel around an inner packet (IPv4/UDP by default, or
+// innerPacket verbatim), matching exactly what decap (bpf/decap/_decap.c)
+// expects to parse.
 func buildRequestFrame(p requestParams) ([]byte, error) {
-	// Inner packet: no Ethernet layer — GWLB encapsulates at L3, and decap
-	// synthesizes the inner Ethernet header itself (see _decap.c).
-	innerIP := &layers.IPv4{
-		Version:  4,
-		TTL:      64,
-		Protocol: layers.IPProtocolUDP,
-		SrcIP:    p.innerSrcIP,
-		DstIP:    p.innerDstIP,
-	}
-	innerUDP := &layers.UDP{
-		SrcPort: layers.UDPPort(p.innerSrcPort),
-		DstPort: layers.UDPPort(p.innerDstPort),
-	}
-	if err := innerUDP.SetNetworkLayerForChecksum(innerIP); err != nil {
-		return nil, fmt.Errorf("SetNetworkLayerForChecksum for inner UDP failed: %w", err)
-	}
+	innerBytes := p.innerPacket
+	if innerBytes == nil {
+		// No Ethernet layer — GWLB encapsulates at L3, and decap synthesizes
+		// the inner Ethernet header itself (see _decap.c).
+		innerIP := &layers.IPv4{
+			Version:  4,
+			TTL:      64,
+			Protocol: layers.IPProtocolUDP,
+			SrcIP:    p.innerSrcIP,
+			DstIP:    p.innerDstIP,
+		}
+		innerUDP := &layers.UDP{
+			SrcPort: layers.UDPPort(p.innerSrcPort),
+			DstPort: layers.UDPPort(p.innerDstPort),
+		}
+		if err := innerUDP.SetNetworkLayerForChecksum(innerIP); err != nil {
+			return nil, fmt.Errorf("SetNetworkLayerForChecksum for inner UDP failed: %w", err)
+		}
 
-	innerBuf := gopacket.NewSerializeBuffer()
-	if err := gopacket.SerializeLayers(innerBuf, serializeOpts, innerIP, innerUDP, gopacket.Payload(p.payload)); err != nil {
-		return nil, fmt.Errorf("serializing inner packet failed: %w", err)
+		innerBuf := gopacket.NewSerializeBuffer()
+		if err := gopacket.SerializeLayers(innerBuf, serializeOpts, innerIP, innerUDP, gopacket.Payload(p.payload)); err != nil {
+			return nil, fmt.Errorf("serializing inner packet failed: %w", err)
+		}
+		innerBytes = innerBuf.Bytes()
 	}
 
 	geneve := &layers.Geneve{
@@ -142,7 +177,7 @@ func buildRequestFrame(p requestParams) ([]byte, error) {
 	}
 
 	outerBuf := gopacket.NewSerializeBuffer()
-	if err := gopacket.SerializeLayers(outerBuf, serializeOpts, eth, outerIP, outerUDP, geneve, gopacket.Payload(innerBuf.Bytes())); err != nil {
+	if err := gopacket.SerializeLayers(outerBuf, serializeOpts, eth, outerIP, outerUDP, geneve, gopacket.Payload(innerBytes)); err != nil {
 		return nil, fmt.Errorf("serializing outer packet failed: %w", err)
 	}
 	return append([]byte(nil), outerBuf.Bytes()...), nil
@@ -169,30 +204,42 @@ type replyPacket struct {
 	payload                    []byte
 }
 
+// decodeOuterFrame parses frame as an outer eth/IPv4/UDP/GENEVE tunnel
+// packet and returns its layers — shared by parseReply (inner UDP) and
+// parseICMPReply (inner ICMP), which only disagree on how to decode
+// whatever gn's GENEVE payload turns out to be.
+func decodeOuterFrame(frame []byte) (eth *layers.Ethernet, outerIP *layers.IPv4, outerUDP *layers.UDP, gn *layers.Geneve, err error) {
+	packet := gopacket.NewPacket(frame, layers.LayerTypeEthernet, gopacket.Default)
+	if errLayer := packet.ErrorLayer(); errLayer != nil {
+		return nil, nil, nil, nil, fmt.Errorf("decoding outer frame failed: %w", errLayer.Error())
+	}
+
+	e, ok := packet.LinkLayer().(*layers.Ethernet)
+	if !ok || e.EthernetType != layers.EthernetTypeIPv4 {
+		return nil, nil, nil, nil, fmt.Errorf("not an IPv4 ethernet frame")
+	}
+	ip, ok := packet.Layer(layers.LayerTypeIPv4).(*layers.IPv4)
+	if !ok {
+		return nil, nil, nil, nil, fmt.Errorf("no outer IPv4 layer")
+	}
+	udp, ok := packet.Layer(layers.LayerTypeUDP).(*layers.UDP)
+	if !ok {
+		return nil, nil, nil, nil, fmt.Errorf("no outer UDP layer")
+	}
+	geneve, ok := packet.Layer(layers.LayerTypeGeneve).(*layers.Geneve)
+	if !ok {
+		return nil, nil, nil, nil, fmt.Errorf("no GENEVE layer (not a GWLB packet?)")
+	}
+	return e, ip, udp, geneve, nil
+}
+
 // parseReply parses frame as an outer eth/IPv4/UDP/GENEVE packet wrapping an
 // inner IPv4/UDP packet — the shape both a request and a reply have (see
 // the type comment on replyPacket).
 func parseReply(frame []byte) (*replyPacket, error) {
-	packet := gopacket.NewPacket(frame, layers.LayerTypeEthernet, gopacket.Default)
-	if errLayer := packet.ErrorLayer(); errLayer != nil {
-		return nil, fmt.Errorf("decoding outer frame failed: %w", errLayer.Error())
-	}
-
-	eth, ok := packet.LinkLayer().(*layers.Ethernet)
-	if !ok || eth.EthernetType != layers.EthernetTypeIPv4 {
-		return nil, fmt.Errorf("not an IPv4 ethernet frame")
-	}
-	outerIP, ok := packet.Layer(layers.LayerTypeIPv4).(*layers.IPv4)
-	if !ok {
-		return nil, fmt.Errorf("no outer IPv4 layer")
-	}
-	outerUDP, ok := packet.Layer(layers.LayerTypeUDP).(*layers.UDP)
-	if !ok {
-		return nil, fmt.Errorf("no outer UDP layer")
-	}
-	gn, ok := packet.Layer(layers.LayerTypeGeneve).(*layers.Geneve)
-	if !ok {
-		return nil, fmt.Errorf("no GENEVE layer (not a GWLB packet?)")
+	eth, outerIP, outerUDP, gn, err := decodeOuterFrame(frame)
+	if err != nil {
+		return nil, err
 	}
 
 	// gn.Contents is the base header plus options, delimited by the base
@@ -243,5 +290,58 @@ func parseReply(frame []byte) (*replyPacket, error) {
 		innerDstPort:         uint16(innerUDP.DstPort),
 		innerIPChecksumValid: verifyIPChecksum(innerIP.Contents),
 		payload:              innerUDP.Payload,
+	}, nil
+}
+
+// icmpReplyPacket is replyPacket's ICMP analogue — only what TestICMPEcho
+// needs, since an ICMP echo has no ports/checksums-of-interest the way a
+// UDP reply does.
+type icmpReplyPacket struct {
+	outerSrcMAC, outerDstMAC net.HardwareAddr
+	outerSrcIP, outerDstIP   net.IP
+	outerDstPort             uint16
+
+	innerSrcIP, innerDstIP net.IP
+	icmpType               uint8
+	icmpID, icmpSeq        uint16
+	payload                []byte
+}
+
+// parseICMPReply is parseReply's ICMP analogue: same outer eth/IPv4/UDP/
+// GENEVE shape, but an inner IPv4/ICMPv4 packet instead of IPv4/UDP.
+func parseICMPReply(frame []byte) (*icmpReplyPacket, error) {
+	eth, outerIP, outerUDP, gn, err := decodeOuterFrame(frame)
+	if err != nil {
+		return nil, err
+	}
+
+	innerPacket := gopacket.NewPacket(gn.LayerPayload(), layers.LayerTypeIPv4, gopacket.Default)
+	if errLayer := innerPacket.ErrorLayer(); errLayer != nil {
+		return nil, fmt.Errorf("decoding inner packet failed: %w", errLayer.Error())
+	}
+	innerIP, ok := innerPacket.Layer(layers.LayerTypeIPv4).(*layers.IPv4)
+	if !ok {
+		return nil, fmt.Errorf("no inner IPv4 layer")
+	}
+	icmp, ok := innerPacket.Layer(layers.LayerTypeICMPv4).(*layers.ICMPv4)
+	if !ok {
+		return nil, fmt.Errorf("no inner ICMPv4 layer")
+	}
+
+	return &icmpReplyPacket{
+		outerDstMAC: eth.DstMAC,
+		outerSrcMAC: eth.SrcMAC,
+
+		outerSrcIP: outerIP.SrcIP,
+		outerDstIP: outerIP.DstIP,
+
+		outerDstPort: uint16(outerUDP.DstPort),
+
+		innerSrcIP: innerIP.SrcIP,
+		innerDstIP: innerIP.DstIP,
+		icmpType:   uint8(icmp.TypeCode.Type()),
+		icmpID:     icmp.Id,
+		icmpSeq:    icmp.Seq,
+		payload:    icmp.Payload,
 	}, nil
 }

@@ -66,6 +66,16 @@ struct geneve_opt_hdr {
 #define IPPROTO_ICMP			1
 #define IPPROTO_TCP			6
 #define IPPROTO_UDP			17
+#define IPPROTO_ICMPV6			58
+
+/* linux/icmp.h / linux/icmpv6.h echo request/reply types — the only ICMP
+ * messages parse_l4_ports (below) gives per-flow identity via their id
+ * field. Everything else (unreachable, time-exceeded, ...) leaves a flow's
+ * ports at 0, same as any other protocol parse_l4_ports doesn't recognize. */
+#define ICMP_ECHO_REQUEST		8
+#define ICMP_ECHO_REPLY			0
+#define ICMPV6_ECHO_REQUEST		128
+#define ICMPV6_ECHO_REPLY		129
 
 /*
  * eth(14) + ip(20) + udp(8) + geneve(8) + opts(32): with decap assuming
@@ -121,6 +131,41 @@ struct flow_key {
 struct outer_hdr_cache {
 	__u8	hdr[OUTER_HDR_LEN];
 };
+
+/*
+ * Fills in *sport / *dport from l4 per proto, for flow_key purposes — shared
+ * by decap and encap so both derive a flow's ports identically. l4 must
+ * already be validated for at least sizeof(struct udphdr) (8) bytes before
+ * data_end; struct icmphdr is the same size, so callers' existing TCP/UDP
+ * bounds check already covers ICMP/ICMPv6 too (see _decap.c/_encap.c).
+ *
+ * TCP/UDP: the real source/dest ports. ICMP/ICMPv6 echo request or reply:
+ * both *sport and *dport get the same value, the echo's own id — ICMP has
+ * no source/dest port pair, just one identifier, and duplicating it into
+ * both makes build_flow_key's NAT-mode port swap a no-op for it rather than
+ * needing ICMP-specific handling there. Anything else (ICMP errors like
+ * unreachable/time-exceeded included) leaves *sport / *dport untouched at the
+ * 0 callers already default them to: those protocols carry no per-flow
+ * identity of their own, so every flow of that protocol between the same
+ * two addresses collapses onto one flow_key.
+ */
+static __always_inline void parse_l4_ports(__u8 proto, void *l4, __u16 *sport, __u16 *dport)
+{
+	if (proto == IPPROTO_TCP || proto == IPPROTO_UDP) {
+		struct udphdr *hdr = l4;
+
+		*sport = hdr->source;
+		*dport = hdr->dest;
+	} else if (proto == IPPROTO_ICMP || proto == IPPROTO_ICMPV6) {
+		struct icmphdr *hdr = l4;
+
+		if (hdr->type == ICMP_ECHO_REQUEST || hdr->type == ICMP_ECHO_REPLY ||
+		    hdr->type == ICMPV6_ECHO_REQUEST || hdr->type == ICMPV6_ECHO_REPLY) {
+			*sport = hdr->id;
+			*dport = hdr->id;
+		}
+	}
+}
 
 /*
  * Flow-key constructor, shared by decap (key from the inner packet as

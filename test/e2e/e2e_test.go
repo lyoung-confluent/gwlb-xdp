@@ -327,6 +327,36 @@ func waitForReply(t *testing.T, fd int, uplinkMAC net.HardwareAddr, timeout time
 	return nil
 }
 
+// waitForICMPReply is waitForReply's ICMP analogue, for TestICMPEcho — same
+// loop, same "tell it apart from our own looped-back request by outer
+// source MAC" logic, just parsing each frame as an ICMP reply instead of a
+// UDP one.
+func waitForICMPReply(t *testing.T, fd int, uplinkMAC net.HardwareAddr, timeout time.Duration) *icmpReplyPacket {
+	t.Helper()
+	tv := unix.NsecToTimeval(timeout.Nanoseconds())
+	if err := unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &tv); err != nil {
+		t.Fatalf("unix.SetsockoptTimeval failed: %v", err)
+	}
+
+	buf := make([]byte, 2048)
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		n, err := unix.Read(fd, buf)
+		if err != nil {
+			if err == unix.EINTR || err == unix.EAGAIN {
+				continue
+			}
+			t.Fatalf("waiting for a GENEVE ICMP reply failed: %v", err)
+		}
+		rp, err := parseICMPReply(buf[:n])
+		if err != nil || !bytes.Equal(rp.outerSrcMAC, uplinkMAC) {
+			continue // not it — e.g. our own request, looped back
+		}
+		return rp
+	}
+	return nil
+}
+
 // sendGENEVE builds a GENEVE request for gwlbID carrying payload from
 // fakeClientIP:fakeClientPort to echoServerIP:echoServerPort, sends it on
 // fd, and returns it alongside the frame's own bytes (callers need both the
@@ -725,4 +755,90 @@ func TestNoNetns(t *testing.T) {
 
 	assertValidReply(t, reply, gwlbIface, reqOpts, payload)
 	assertOKMetrics(t, one.outerIfindex, len(reqFrame), len(payload))
+}
+
+// TestICMPEcho drives an ICMP echo request through decap and back through
+// encap as an echo reply — decap/encap's ICMP support (parse_l4_ports in
+// bpf/geneve_defs.h) keys the flow by the echo's own id, the same way a
+// TCP/UDP flow is keyed by port. Nothing needs to run in the ENI's netns to
+// answer the ping: the kernel replies on its own to an echo request
+// addressed to any of its interfaces' own IPs, which is exactly what
+// provisionENI's AddrAdd gives echoServerIP — so this needs no echo server,
+// unlike TestEndToEnd's UDP round trip.
+func TestICMPEcho(t *testing.T) {
+	requireRoot(t)
+	_ = unix.Mount("bpf", "/sys/fs/bpf", "bpf", 0, "")
+
+	gwlbID := uint64(0xE2E)
+
+	uplinkIface, gwlbIface := setupUplink(t)
+	runSetup(t, 8)
+	one := provisionENI(t, gwlbID, true, echoServerIP, echoServerPort, fakeClientIP, fakeClientMAC, func(b []byte) []byte { return b })
+	fd := openGWLBSocket(t, gwlbIface)
+
+	const icmpID, icmpSeq = 0x1234, 1
+	payload := []byte("hello from gwlb-xdp e2e test (icmp)")
+
+	innerPacket, err := buildInnerICMPEchoRequest(net.ParseIP(fakeClientIP), net.ParseIP(echoServerIP), icmpID, icmpSeq, payload)
+	if err != nil {
+		t.Fatalf("buildInnerICMPEchoRequest failed: %v", err)
+	}
+	frame, err := buildRequestFrame(requestParams{
+		outerSrcMAC:  gwlbIface.HardwareAddr,
+		outerDstMAC:  uplinkIface.HardwareAddr,
+		outerSrcIP:   net.ParseIP(fakeGWLBOuterSrcIP),
+		outerDstIP:   net.ParseIP(fakeGWLBOuterDstIP),
+		outerSrcPort: fakeOuterSrcPort,
+		vni:          [3]byte{0, 0, 0},
+		opts:         buildGeneveOptions(gwlbID, fakeAttachmentID, fakeFlowCookie),
+		innerPacket:  innerPacket,
+	})
+	if err != nil {
+		t.Fatalf("buildRequestFrame failed: %v", err)
+	}
+	if err := unix.Sendto(fd, frame, 0, &unix.SockaddrLinklayer{Ifindex: gwlbIface.Index}); err != nil {
+		t.Fatalf("unix.Sendto failed: %v", err)
+	}
+
+	reply := waitForICMPReply(t, fd, uplinkIface.HardwareAddr, 5*time.Second)
+	if reply == nil {
+		t.Fatal("no GENEVE ICMP reply observed on the simulated uplink within 5s")
+	}
+
+	const icmpEchoReply = 0 // linux/icmp.h ICMP_ECHOREPLY
+	if reply.icmpType != icmpEchoReply {
+		t.Errorf("reply ICMP type = %d, want %d (echo reply)", reply.icmpType, icmpEchoReply)
+	}
+	if reply.icmpID != icmpID || reply.icmpSeq != icmpSeq {
+		t.Errorf("reply ICMP id/seq = %d/%d, want %d/%d (the kernel echoes both back unchanged)",
+			reply.icmpID, reply.icmpSeq, icmpID, icmpSeq)
+	}
+	if !bytes.Equal(reply.payload, payload) {
+		t.Errorf("reply payload = %q, want %q", reply.payload, payload)
+	}
+
+	// Outer/inner addressing swapped exactly as a UDP reply's would be (see
+	// assertValidReply) — decap's flow_key doesn't treat ICMP specially
+	// beyond parse_l4_ports, so the same NAT-orientation lookup applies.
+	if !bytes.Equal(reply.outerDstMAC, gwlbIface.HardwareAddr) {
+		t.Errorf("reply outer dst MAC = %v, want %v (this harness's own)", reply.outerDstMAC, gwlbIface.HardwareAddr)
+	}
+	if !reply.outerSrcIP.Equal(net.ParseIP(fakeGWLBOuterDstIP)) || !reply.outerDstIP.Equal(net.ParseIP(fakeGWLBOuterSrcIP)) {
+		t.Errorf("reply outer IPs = %s -> %s, want %s -> %s (swapped)",
+			reply.outerSrcIP, reply.outerDstIP, fakeGWLBOuterDstIP, fakeGWLBOuterSrcIP)
+	}
+	if reply.outerDstPort != genevePort {
+		t.Errorf("reply outer UDP dst port = %d, want %d", reply.outerDstPort, genevePort)
+	}
+	if !reply.innerSrcIP.Equal(net.ParseIP(echoServerIP)) || !reply.innerDstIP.Equal(net.ParseIP(fakeClientIP)) {
+		t.Errorf("reply inner IPs = %s -> %s, want %s -> %s",
+			reply.innerSrcIP, reply.innerDstIP, echoServerIP, fakeClientIP)
+	}
+
+	if got := metricSum(t, "decap_ok_packets", one.outerIfindex); got != 1 {
+		t.Errorf("decap_ok_packets[outer ifindex] = %d, want 1", got)
+	}
+	if got := metricSum(t, "encap_ok_packets", one.outerIfindex); got != 1 {
+		t.Errorf("encap_ok_packets[outer ifindex] = %d, want 1", got)
+	}
 }

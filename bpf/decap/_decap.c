@@ -242,9 +242,11 @@ int decap(struct xdp_md *ctx)
 			return XDP_DROP;
 		}
 
-		if (inner_ip->protocol == IPPROTO_TCP || inner_ip->protocol == IPPROTO_UDP) {
-			/* sport/dport are the first two u16s of both TCP and
-			 * UDP, so a udphdr-shaped read serves either. */
+		if (inner_ip->protocol == IPPROTO_TCP || inner_ip->protocol == IPPROTO_UDP ||
+		    inner_ip->protocol == IPPROTO_ICMP) {
+			/* sport/dport (TCP/UDP) or id (ICMP) are all within the
+			 * first 8 bytes, so a udphdr-shaped bounds check covers
+			 * either — see parse_l4_ports. */
 			__u8 *l4 = (__u8 *)inner_ip + (inner_ip->ihl * 4);
 			struct udphdr *l4hdr = (void *)l4;
 
@@ -253,10 +255,9 @@ int decap(struct xdp_md *ctx)
 				increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 				return XDP_DROP;
 			}
-			inner_sport = l4hdr->source;
-			inner_dport = l4hdr->dest;
+			parse_l4_ports(inner_ip->protocol, l4, &inner_sport, &inner_dport);
 		}
-		/* ICMP and others: ports left 0, flow keyed on addrs+proto. */
+		/* Other protocols: ports left 0, flow keyed on addrs+proto. */
 		saddr.v4 = inner_ip->saddr;
 		daddr.v4 = inner_ip->daddr;
 		inner_proto = inner_ip->protocol;
@@ -270,7 +271,8 @@ int decap(struct xdp_md *ctx)
 		}
 		/* Extension headers aren't walked: for GWLB traffic L4 sits
 		 * immediately after the 40-byte base header. */
-		if (inner_ip6->nexthdr == IPPROTO_TCP || inner_ip6->nexthdr == IPPROTO_UDP) {
+		if (inner_ip6->nexthdr == IPPROTO_TCP || inner_ip6->nexthdr == IPPROTO_UDP ||
+		    inner_ip6->nexthdr == IPPROTO_ICMPV6) {
 			struct udphdr *l4hdr = (void *)(inner_ip6 + 1);
 
 			if ((void *)(l4hdr + 1) > data_end) {
@@ -278,8 +280,7 @@ int decap(struct xdp_md *ctx)
 				increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 				return XDP_DROP;
 			}
-			inner_sport = l4hdr->source;
-			inner_dport = l4hdr->dest;
+			parse_l4_ports(inner_ip6->nexthdr, l4hdr, &inner_sport, &inner_dport);
 		}
 		__builtin_memcpy(saddr.v6, &inner_ip6->saddr, 16);
 		__builtin_memcpy(daddr.v6, &inner_ip6->daddr, 16);

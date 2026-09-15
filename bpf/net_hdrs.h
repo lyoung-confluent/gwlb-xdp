@@ -77,6 +77,16 @@ struct udphdr {
 	__sum16	check;
 };
 
+/* linux/icmp.h and linux/icmpv6.h's echo request/reply share this layout
+ * byte-for-byte (RFC 792/RFC 4443) — one struct serves both. */
+struct icmphdr {
+	__u8	type;
+	__u8	code;
+	__sum16	checksum;
+	__be16	id;
+	__be16	sequence;
+};
+
 /* linux/tcp.h, fixed 20-byte part only. This codebase only locates the
  * checksum field, so the data-offset/flags bytes aren't broken into
  * sub-fields. */

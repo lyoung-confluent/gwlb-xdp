@@ -116,7 +116,8 @@ int encap(struct xdp_md *ctx)
 			return XDP_DROP;
 		}
 
-		if (ip->protocol == IPPROTO_TCP || ip->protocol == IPPROTO_UDP) {
+		if (ip->protocol == IPPROTO_TCP || ip->protocol == IPPROTO_UDP ||
+		    ip->protocol == IPPROTO_ICMP) {
 			__u8 *l4 = (__u8 *)ip + (ip->ihl * 4);
 			struct udphdr *l4hdr = (void *)l4;
 
@@ -125,8 +126,7 @@ int encap(struct xdp_md *ctx)
 				increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 				return XDP_DROP;
 			}
-			sport = l4hdr->source;
-			dport = l4hdr->dest;
+			parse_l4_ports(ip->protocol, l4, &sport, &dport);
 		}
 		proto = ip->protocol;
 		saddr.v4 = ip->saddr;
@@ -140,7 +140,8 @@ int encap(struct xdp_md *ctx)
 			return XDP_DROP;
 		}
 		/* Extension headers aren't walked — see _decap.c. */
-		if (ip6->nexthdr == IPPROTO_TCP || ip6->nexthdr == IPPROTO_UDP) {
+		if (ip6->nexthdr == IPPROTO_TCP || ip6->nexthdr == IPPROTO_UDP ||
+		    ip6->nexthdr == IPPROTO_ICMPV6) {
 			struct udphdr *l4hdr = (void *)(ip6 + 1);
 
 			if ((void *)(l4hdr + 1) > data_end) {
@@ -148,8 +149,7 @@ int encap(struct xdp_md *ctx)
 				increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 				return XDP_DROP;
 			}
-			sport = l4hdr->source;
-			dport = l4hdr->dest;
+			parse_l4_ports(ip6->nexthdr, l4hdr, &sport, &dport);
 		}
 		proto = ip6->nexthdr;
 		__builtin_memcpy(saddr.v6, &ip6->saddr, 16);
