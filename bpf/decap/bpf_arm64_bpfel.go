@@ -50,8 +50,7 @@ type bpfMetricKey struct {
 
 type bpfOuterHdrCache struct {
 	_   structs.HostLayout
-	Len uint16
-	Hdr [96]uint8
+	Hdr [82]uint8
 }
 
 // Names of all BPF objects in the ELF.

@@ -41,7 +41,10 @@ const (
 	fakeGWLBOuterDstIP = "198.51.100.2" // stands in for this box's IP
 	fakeOuterSrcPort   = 12345
 
-	fakeAttachmentID = 0xAAAABBBBCCCCDDDD
+	// decap now drops any packet whose attachment ID or GENEVE VNI isn't
+	// exactly 0 (see _decap.c), so both must stay 0 for every frame these
+	// tests expect to actually reach a backend.
+	fakeAttachmentID = 0
 	fakeFlowCookie   = 0x11223344
 
 	unknownGWLBID = 0xBAD // never provisioned — see the "unknown ENI" subtest
@@ -291,8 +294,9 @@ func metricSum(t *testing.T, counterName string, ifindex uint32) uint64 {
 // own request loops back to this same socket too (any packet socket bound
 // to an interface sees traffic leaving it, same as tcpdump would) — the
 // real reply is told apart from that by source MAC: the request's source is
-// this harness's own address, while the reply's source is uplink_mac (set
-// at `setup`, see bpf/encap/_encap.c).
+// this harness's own address, while the reply's source is the request's own
+// destination MAC (uplinkMAC), swapped into place by encap (see _encap.c) —
+// there's no separately configured uplink MAC to set at `setup` anymore.
 func waitForReply(t *testing.T, fd int, uplinkMAC net.HardwareAddr, timeout time.Duration) *replyPacket {
 	t.Helper()
 	tv := unix.NsecToTimeval(timeout.Nanoseconds())
@@ -336,7 +340,7 @@ func sendGENEVE(t *testing.T, fd int, uplinkIface, gwlbIface *net.Interface, gwl
 		outerSrcIP:   net.ParseIP(fakeGWLBOuterSrcIP),
 		outerDstIP:   net.ParseIP(fakeGWLBOuterDstIP),
 		outerSrcPort: fakeOuterSrcPort,
-		vni:          [3]byte{0, 0, 1},
+		vni:          [3]byte{0, 0, 0}, // decap drops any nonzero VNI now — see _decap.c
 		opts:         buildGeneveOptions(gwlbID, fakeAttachmentID, fakeFlowCookie),
 		innerSrcIP:   net.ParseIP(fakeClientIP),
 		innerDstIP:   net.ParseIP(echoServerIP),
@@ -439,7 +443,7 @@ func assertOKMetrics(t *testing.T, outerIfindex uint32, reqFrameLen, payloadLen 
 // uplink's role, lets decap/encap and a real UDP echo server (running in the
 // ENI's own netns, standing in for the backend/appliance) carry it end to
 // end, and checks the GENEVE reply that comes back out the same veth — plus
-// the metrics that exchange should have moved, and two ways a bad packet is
+// the metrics that exchange should have moved, and four ways a bad packet is
 // supposed to be dropped rather than answered.
 func TestEndToEnd(t *testing.T) {
 	requireRoot(t)
@@ -483,7 +487,7 @@ func TestEndToEnd(t *testing.T) {
 			outerSrcIP:   net.ParseIP(fakeGWLBOuterSrcIP),
 			outerDstIP:   net.ParseIP(fakeGWLBOuterDstIP),
 			outerSrcPort: fakeOuterSrcPort,
-			vni:          [3]byte{0, 0, 1},
+			vni:          [3]byte{0, 0, 0}, // decap drops any nonzero VNI now — see _decap.c
 			opts:         badOpts,
 			innerSrcIP:   net.ParseIP(fakeClientIP),
 			innerDstIP:   net.ParseIP(echoServerIP),
@@ -515,8 +519,8 @@ func TestEndToEnd(t *testing.T) {
 			outerSrcIP:   net.ParseIP(fakeGWLBOuterSrcIP),
 			outerDstIP:   net.ParseIP(fakeGWLBOuterDstIP),
 			outerSrcPort: fakeOuterSrcPort,
-			geneveVer:    1, // decap only accepts ver == 0 — see _decap.c
-			vni:          [3]byte{0, 0, 1},
+			geneveVer:    1,                // decap only accepts ver == 0 — see _decap.c
+			vni:          [3]byte{0, 0, 0}, // decap drops any nonzero VNI now — see _decap.c
 			opts:         buildGeneveOptions(gwlbID, fakeAttachmentID, fakeFlowCookie),
 			innerSrcIP:   net.ParseIP(fakeClientIP),
 			innerDstIP:   net.ParseIP(echoServerIP),
@@ -538,6 +542,77 @@ func TestEndToEnd(t *testing.T) {
 		}
 		if got := metricSum(t, "decap_drop_malformed_bytes", uint32(uplinkIface.Index)); got != uint64(len(badFrame)) {
 			t.Errorf("decap_drop_malformed_bytes[uplink ifindex] = %d, want %d", got, len(badFrame))
+		}
+	})
+
+	t.Run("nonzero attachment ID is dropped", func(t *testing.T) {
+		badFrame, err := buildRequestFrame(requestParams{
+			outerSrcMAC:  gwlbIface.HardwareAddr,
+			outerDstMAC:  uplinkIface.HardwareAddr,
+			outerSrcIP:   net.ParseIP(fakeGWLBOuterSrcIP),
+			outerDstIP:   net.ParseIP(fakeGWLBOuterDstIP),
+			outerSrcPort: fakeOuterSrcPort,
+			vni:          [3]byte{0, 0, 0},
+			opts:         buildGeneveOptions(gwlbID, 0xAAAABBBBCCCCDDDD, fakeFlowCookie), // decap only accepts attachment ID 0 — see _decap.c
+			innerSrcIP:   net.ParseIP(fakeClientIP),
+			innerDstIP:   net.ParseIP(echoServerIP),
+			innerSrcPort: fakeClientPort,
+			innerDstPort: echoServerPort,
+			payload:      payload,
+		})
+		if err != nil {
+			t.Fatalf("buildRequestFrame failed: %v", err)
+		}
+		// decap_drop_malformed_* already carries the "malformed GENEVE
+		// version" subtest's count above, so check the delta this send
+		// causes rather than an absolute value.
+		beforePackets := metricSum(t, "decap_drop_malformed_packets", uint32(uplinkIface.Index))
+		beforeBytes := metricSum(t, "decap_drop_malformed_bytes", uint32(uplinkIface.Index))
+		if err := unix.Sendto(fd, badFrame, 0, &unix.SockaddrLinklayer{Ifindex: gwlbIface.Index}); err != nil {
+			t.Fatalf("unix.Sendto failed: %v", err)
+		}
+		if reply := waitForReply(t, fd, uplinkIface.HardwareAddr, 2*time.Second); reply != nil {
+			t.Fatalf("got a GENEVE reply for a nonzero attachment ID, want none: %+v", reply)
+		}
+		if got := metricSum(t, "decap_drop_malformed_packets", uint32(uplinkIface.Index)); got != beforePackets+1 {
+			t.Errorf("decap_drop_malformed_packets[uplink ifindex] = %d, want %d", got, beforePackets+1)
+		}
+		if got := metricSum(t, "decap_drop_malformed_bytes", uint32(uplinkIface.Index)); got != beforeBytes+uint64(len(badFrame)) {
+			t.Errorf("decap_drop_malformed_bytes[uplink ifindex] = %d, want %d", got, beforeBytes+uint64(len(badFrame)))
+		}
+	})
+
+	t.Run("nonzero GENEVE VNI is dropped", func(t *testing.T) {
+		badFrame, err := buildRequestFrame(requestParams{
+			outerSrcMAC:  gwlbIface.HardwareAddr,
+			outerDstMAC:  uplinkIface.HardwareAddr,
+			outerSrcIP:   net.ParseIP(fakeGWLBOuterSrcIP),
+			outerDstIP:   net.ParseIP(fakeGWLBOuterDstIP),
+			outerSrcPort: fakeOuterSrcPort,
+			vni:          [3]byte{0, 0, 1}, // decap only accepts VNI 0 — see _decap.c
+			opts:         buildGeneveOptions(gwlbID, fakeAttachmentID, fakeFlowCookie),
+			innerSrcIP:   net.ParseIP(fakeClientIP),
+			innerDstIP:   net.ParseIP(echoServerIP),
+			innerSrcPort: fakeClientPort,
+			innerDstPort: echoServerPort,
+			payload:      payload,
+		})
+		if err != nil {
+			t.Fatalf("buildRequestFrame failed: %v", err)
+		}
+		beforePackets := metricSum(t, "decap_drop_malformed_packets", uint32(uplinkIface.Index))
+		beforeBytes := metricSum(t, "decap_drop_malformed_bytes", uint32(uplinkIface.Index))
+		if err := unix.Sendto(fd, badFrame, 0, &unix.SockaddrLinklayer{Ifindex: gwlbIface.Index}); err != nil {
+			t.Fatalf("unix.Sendto failed: %v", err)
+		}
+		if reply := waitForReply(t, fd, uplinkIface.HardwareAddr, 2*time.Second); reply != nil {
+			t.Fatalf("got a GENEVE reply for a nonzero VNI, want none: %+v", reply)
+		}
+		if got := metricSum(t, "decap_drop_malformed_packets", uint32(uplinkIface.Index)); got != beforePackets+1 {
+			t.Errorf("decap_drop_malformed_packets[uplink ifindex] = %d, want %d", got, beforePackets+1)
+		}
+		if got := metricSum(t, "decap_drop_malformed_bytes", uint32(uplinkIface.Index)); got != beforeBytes+uint64(len(badFrame)) {
+			t.Errorf("decap_drop_malformed_bytes[uplink ifindex] = %d, want %d", got, beforeBytes+uint64(len(badFrame)))
 		}
 	})
 }

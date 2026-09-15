@@ -37,8 +37,8 @@ const (
 var serializeOpts = gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
 
 // buildGeneveOptions returns the three mandatory AWS GWLB GENEVE options
-// (ENI ID, attachment ID, flow cookie), as decap's option-parsing loop
-// expects them (see bpf/geneve_defs.h).
+// (ENI ID, attachment ID, flow cookie), in the exact fixed order decap
+// assumes them to be in (see bpf/decap/_decap.c and bpf/geneve_defs.h).
 func buildGeneveOptions(eniID, attachmentID uint64, flowCookie uint32) []*layers.GeneveOption {
 	eniData := make([]byte, 8)
 	binary.BigEndian.PutUint64(eniData, eniID)

@@ -4,41 +4,6 @@
 #include "geneve_defs.h"
 #include "maps.h"
 
-/* Smallest valid cached outer header: eth + ip + udp. */
-#define MIN_OUTER_HDR_BYTES \
-	(sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr))
-
-/* Reject a cached outer header too short to hold eth+ip+udp, or longer than the
- * cache buffer. The upper bound is also what lets the verifier accept cache.len
- * as a length argument to the bpf_xdp_*_bytes() helpers (a __u16 map field is
- * otherwise an unbounded 0..65535 scalar). This must be re-asserted at each
- * point of use: every intervening helper call reloads cache.len from its stack
- * spill, widening the range back out. Kept as one macro so all three sites stay
- * provably identical. Expands only inside encap, so it reads the enclosing
- * `ifindex` (ctx->ingress_ifindex) for the per-ENI counter. */
-#define REJECT_BAD_CACHE_LEN(c) \
-	do { \
-		if ((c).len < (__u16)MIN_OUTER_HDR_BYTES || \
-		    (c).len > MAX_OUTER_HDR_BYTES) { \
-			increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED_PACKETS, 1); \
-			increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED_BYTES, frame_len); \
-			return XDP_DROP; \
-		} \
-	} while (0)
-
-/* This box's own hwaddr for the synthesized outer Ethernet header, set by the
- * loader before load.
- *
- * Six scalars rather than one __u8[6]: an array-typed .rodata global read back
- * as all-zero at runtime with this clang/BPF toolchain, while scalar .rodata
- * works. */
-const volatile __u8 uplink_mac_0 = 0;
-const volatile __u8 uplink_mac_1 = 0;
-const volatile __u8 uplink_mac_2 = 0;
-const volatile __u8 uplink_mac_3 = 0;
-const volatile __u8 uplink_mac_4 = 0;
-const volatile __u8 uplink_mac_5 = 0;
-
 /* The reply's redirect target, fixed for the life of the program, so it lives
  * in .rodata rather than a devmap: plain bpf_redirect(ifindex, 0) gets the
  * same bulk-queue batching as bpf_redirect_map() since Linux 5.13.
@@ -105,10 +70,6 @@ int encap(struct xdp_md *ctx)
 	__u32 ifindex = ctx->ingress_ifindex;
 
 	bool transparent = eni_mode != 0;
-
-	__u8 uplink_mac[6] = {
-		uplink_mac_0, uplink_mac_1, uplink_mac_2, uplink_mac_3, uplink_mac_4, uplink_mac_5,
-	};
 
 	struct ethhdr *eth = data;
 	if ((void *)(eth + 1) > data_end) {
@@ -222,21 +183,18 @@ int encap(struct xdp_md *ctx)
 	}
 	struct outer_hdr_cache cache = *cache_p; /* copy out before adjust_head */
 
-	REJECT_BAD_CACHE_LEN(cache);
-
-	/* Drop the veth's L2 framing, reopen room for the cached outer header. */
-	int delta = (int)sizeof(struct ethhdr) - (int)cache.len;
+	/* Drop the veth's 14-byte L2 framing, reopen room for the cached
+	 * eth+ip+udp+geneve+opts header (OUTER_HDR_LEN, now an exact size —
+	 * see geneve_defs.h — not something to re-check per use the way a
+	 * variable cached length would need). */
+	int delta = (int)sizeof(struct ethhdr) - (int)OUTER_HDR_LEN;
 	if (bpf_xdp_adjust_head(ctx, delta)) {
 		increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED_PACKETS, 1);
 		increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 		return XDP_DROP;
 	}
 
-	/* Re-check: adjust_head reloaded cache.len from a spill, losing the
-	 * narrowed range (see the macro). */
-	REJECT_BAD_CACHE_LEN(cache);
-
-	if (bpf_xdp_store_bytes(ctx, 0, cache.hdr, cache.len)) {
+	if (bpf_xdp_store_bytes(ctx, 0, cache.hdr, OUTER_HDR_LEN)) {
 		increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED_PACKETS, 1);
 		increment_metric(ifindex, ENCAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 		return XDP_DROP;
@@ -264,17 +222,12 @@ int encap(struct xdp_md *ctx)
 		return XDP_DROP;
 	}
 
-	/* Reply's dst MAC is the cached frame's src MAC (the delivering peer):
-	 * set dst from src first, then overwrite src with this box's address. */
-	__builtin_memcpy(new_eth->h_dest, new_eth->h_source, 6);
-	__builtin_memcpy(new_eth->h_source, uplink_mac, 6);
-	new_eth->h_proto = bpf_htons(ETH_P_IP);
-
-	/* decap saw src=GWLBE dst=appliance; the reply needs the reverse. */
-	__be32 old_src = new_ip->saddr, old_dst = new_ip->daddr;
-	new_ip->saddr = old_dst;
-	new_ip->daddr = old_src;
-
+	/* Nothing to fix up in new_eth/new_ip's addressing: decap already
+	 * swapped both the Ethernet dst/src and the IP saddr/daddr before
+	 * ever caching this header (see _decap.c), so the store above already
+	 * left them correct for the reply. Only the fields that depend on
+	 * this specific reply's own size — computed below — still need
+	 * touching after the replay. */
 	__u16 total_len = (__u16)((__u8 *)data_end - (__u8 *)data - sizeof(struct ethhdr));
 	new_ip->tot_len = bpf_htons(total_len);
 	new_ip->check = 0;

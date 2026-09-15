@@ -34,10 +34,36 @@ struct {
 	__uint(map_flags, 0);
 } eni_to_ifindex SEC(".maps");
 
-/* Trip count for the option-parsing loop: MAX_GENEVE_OPT_BYTES worth of
- * options, 4 bytes (smallest opt header) at a time. Must be a compile-time
- * constant so the loop can be fully unrolled. */
-#define GENEVE_OPT_MAX_ITER	(MAX_GENEVE_OPT_BYTES / 4)
+/*
+ * Validates one GWLB GENEVE option at *pos — class/type/length must match
+ * exactly, not just fit a bound — and advances *pos past it (header +
+ * data) on success. Returns a pointer to its data, or NULL if it doesn't
+ * match (including running past data_end), in which case *pos is left
+ * unmodified and the caller drops the packet as malformed.
+ *
+ * decap calls this exactly three times, once per option, in the fixed
+ * order GWLB always sends (see geneve_defs.h) — this isn't a generic
+ * options walk, just shared bounds/field-matching logic for three
+ * straight-line call sites.
+ */
+static __always_inline void *parse_gwlb_opt(__u8 **pos, void *data_end,
+					     __u8 type, __u32 want_len)
+{
+	struct geneve_opt_hdr *opt = (void *)*pos;
+
+	if ((void *)(opt + 1) > data_end)
+		return NULL;
+	if (opt->opt_class != bpf_htons(GENEVE_OPT_CLASS_AWS) ||
+	    opt->type != type || opt->length * 4 != want_len)
+		return NULL;
+
+	__u8 *data = (__u8 *)(opt + 1);
+	if ((void *)(data + want_len) > data_end)
+		return NULL;
+
+	*pos = data + want_len;
+	return data;
+}
 
 /* Per-address-family enable flags, set by the loader before load (default:
  * both enabled). A disabled family's flow_state map is shrunk to one entry;
@@ -99,11 +125,21 @@ int decap(struct xdp_md *ctx)
 		increment_metric(ingress_ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 		return XDP_DROP;
 	}
+	/* GWLB's own tunnel VNI, distinct from the AWS ENI ID carried as a
+	 * GENEVE option below. GWLB never sets it, so anything else means
+	 * this box is being sent traffic it shouldn't be. */
+	if (gnv->vni[0] != 0 || gnv->vni[1] != 0 || gnv->vni[2] != 0) {
+		increment_metric(ingress_ifindex, DECAP_CNT_DROP_MALFORMED_PACKETS, 1);
+		increment_metric(ingress_ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
+		return XDP_DROP;
+	}
 
+	/* GWLB always sends exactly GWLB_OPTS_LEN bytes of options — the three
+	 * parsed below, fixed order and fixed length, no more and no less. */
 	__u32 opt_len = gnv->opt_len * 4;
-	if (opt_len > MAX_GENEVE_OPT_BYTES) {
-		increment_metric(ingress_ifindex, DECAP_CNT_DROP_HDR_TOO_LONG_PACKETS, 1);
-		increment_metric(ingress_ifindex, DECAP_CNT_DROP_HDR_TOO_LONG_BYTES, frame_len);
+	if (opt_len != GWLB_OPTS_LEN) {
+		increment_metric(ingress_ifindex, DECAP_CNT_DROP_MALFORMED_PACKETS, 1);
+		increment_metric(ingress_ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 		return XDP_DROP;
 	}
 
@@ -115,67 +151,41 @@ int decap(struct xdp_md *ctx)
 		return XDP_DROP;
 	}
 
-	__u64 eni_id = 0, attachment_id = 0;
-	__u32 flow_cookie = 0;
-	bool have_eni = false;
-	bool malformed = false;
-
-	/* The body has no break/continue/return: clang's unroller won't unroll
-	 * a bpf-target loop containing an early exit, and left un-unrolled the
-	 * verifier blows its instruction budget on the back-edge. Every
-	 * iteration runs unconditionally, guarded by `pos < opt_end`. */
+	/* Option 1: ENI ID — which VPC endpoint this packet belongs to. */
 	__u8 *pos = opt_start;
-#pragma clang loop unroll(full)
-	for (int i = 0; i < GENEVE_OPT_MAX_ITER; i++) {
-		if (pos < opt_end && !malformed) {
-			struct geneve_opt_hdr *opt = (void *)pos;
-			if ((void *)(opt + 1) > data_end) {
-				malformed = true;
-			} else {
-				__u32 this_opt_len = opt->length * 4;
-				__u8 *opt_data = pos + sizeof(*opt);
-
-				if (opt->opt_class == bpf_htons(GENEVE_OPT_CLASS_AWS)) {
-					if (opt->type == GWLB_OPT_TYPE_ENI &&
-					    this_opt_len == GWLB_OPT_ENI_LEN) {
-						if ((void *)(opt_data + GWLB_OPT_ENI_LEN) > data_end) {
-							malformed = true;
-						} else {
-							eni_id = bpf_be64_to_cpu(*(__be64 *)opt_data);
-							have_eni = true;
-						}
-					} else if (opt->type == GWLB_OPT_TYPE_ATTACHMENT &&
-						   this_opt_len == GWLB_OPT_ATTACHMENT_LEN) {
-						if ((void *)(opt_data + GWLB_OPT_ATTACHMENT_LEN) > data_end) {
-							malformed = true;
-						} else {
-							attachment_id = bpf_be64_to_cpu(*(__be64 *)opt_data);
-						}
-					} else if (opt->type == GWLB_OPT_TYPE_COOKIE &&
-						   this_opt_len == GWLB_OPT_COOKIE_LEN) {
-						if ((void *)(opt_data + GWLB_OPT_COOKIE_LEN) > data_end) {
-							malformed = true;
-						} else {
-							flow_cookie = bpf_ntohl(*(__be32 *)opt_data);
-						}
-					}
-				}
-
-				if (!malformed)
-					pos += sizeof(*opt) + this_opt_len;
-			}
-		}
-	}
-	/* Parsed but not consumed yet — will matter once dispatch keys on more
-	 * than the ENI ID, or once cookie validation is added. */
-	(void)attachment_id;
-	(void)flow_cookie;
-
-	if (malformed || !have_eni) {
+	void *opt_data = parse_gwlb_opt(&pos, data_end, GWLB_OPT_TYPE_ENI, GWLB_OPT_ENI_LEN);
+	if (!opt_data) {
 		increment_metric(ingress_ifindex, DECAP_CNT_DROP_MALFORMED_PACKETS, 1);
 		increment_metric(ingress_ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 		return XDP_DROP;
 	}
+	__u64 eni_id = bpf_be64_to_cpu(*(__be64 *)opt_data);
+
+	/* Option 2: Attachment ID. GWLB only ever attaches this box as a
+	 * single appliance, so anything but 0 means either a multi-appliance
+	 * deployment this box doesn't support, or a packet not meant for it. */
+	opt_data = parse_gwlb_opt(&pos, data_end, GWLB_OPT_TYPE_ATTACHMENT, GWLB_OPT_ATTACHMENT_LEN);
+	if (!opt_data) {
+		increment_metric(ingress_ifindex, DECAP_CNT_DROP_MALFORMED_PACKETS, 1);
+		increment_metric(ingress_ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
+		return XDP_DROP;
+	}
+	if (bpf_be64_to_cpu(*(__be64 *)opt_data) != 0) {
+		increment_metric(ingress_ifindex, DECAP_CNT_DROP_MALFORMED_PACKETS, 1);
+		increment_metric(ingress_ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
+		return XDP_DROP;
+	}
+
+	/* Option 3: flow cookie. Parsed but not consumed yet — will matter
+	 * once cookie validation is added. */
+	opt_data = parse_gwlb_opt(&pos, data_end, GWLB_OPT_TYPE_COOKIE, GWLB_OPT_COOKIE_LEN);
+	if (!opt_data) {
+		increment_metric(ingress_ifindex, DECAP_CNT_DROP_MALFORMED_PACKETS, 1);
+		increment_metric(ingress_ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
+		return XDP_DROP;
+	}
+	__u32 flow_cookie = bpf_ntohl(*(__be32 *)opt_data);
+	(void)flow_cookie;
 
 	struct eni_info *info = bpf_map_lookup_elem(&eni_to_ifindex, &eni_id);
 	if (!info) {
@@ -292,28 +302,46 @@ int decap(struct xdp_md *ctx)
 		build_flow_key_v6(&fwd_key6, ifindex, &v6_saddr, &v6_daddr,
 				   inner_sport, inner_dport, inner_proto);
 
-	/* Computed from fixed sizes plus opt_len rather than (opt_end - eth):
-	 * the pointer subtraction leaves the verifier unable to prove the
-	 * result non-negative after stack spills, whereas opt_len is already a
-	 * tightly-bounded scalar. */
-	__u32 outer_len = (__u32)sizeof(struct ethhdr) + sizeof(struct iphdr) +
-			  sizeof(struct udphdr) + sizeof(struct gwlb_genevehdr) +
-			  opt_len;
-	if (outer_len > MAX_OUTER_HDR_BYTES) {
-		/* Unreachable given the opt_len cap, but the verifier needs it. */
-		increment_metric(ifindex, DECAP_CNT_DROP_HDR_TOO_LONG_PACKETS, 1);
-		increment_metric(ifindex, DECAP_CNT_DROP_HDR_TOO_LONG_BYTES, frame_len);
-		return XDP_DROP;
-	}
-
+	/* eth+ip+udp+geneve+opts is now OUTER_HDR_LEN exactly — opt_len was
+	 * just verified to be GWLB_OPTS_LEN, not merely bounded by it — so the
+	 * whole outer header is cached verbatim in one load, Ethernet header
+	 * included (see the comment on struct outer_hdr_cache). */
 	struct outer_hdr_cache cache;
 	__builtin_memset(&cache, 0, sizeof(cache));
-	cache.len = (__u16)outer_len;
-	if (bpf_xdp_load_bytes(ctx, 0, cache.hdr, outer_len)) {
+	if (bpf_xdp_load_bytes(ctx, 0, cache.hdr, OUTER_HDR_LEN)) {
 		increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_PACKETS, 1);
 		increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 		return XDP_DROP;
 	}
+
+	/* Pre-swap the addressing that the eventual reply will need reversed,
+	 * so encap can replay this cache onto the wire completely unmodified.
+	 * Doing it here rather than in encap means it runs once per request
+	 * instead of once per reply — a real saving whenever a flow's traffic
+	 * is asymmetric (e.g. a bulk download's data packets outnumber its
+	 * acks), and never a loss otherwise. */
+	struct ethhdr *cache_eth = (struct ethhdr *)cache.hdr;
+
+	__u8 dst_mac[6], src_mac[6];
+	__builtin_memcpy(dst_mac, cache_eth->h_dest, 6);
+	__builtin_memcpy(src_mac, cache_eth->h_source, 6);
+	__builtin_memcpy(cache_eth->h_dest, src_mac, 6);
+	__builtin_memcpy(cache_eth->h_source, dst_mac, 6);
+
+	/* saddr/daddr sit at a 2-byte-shy-of-4-aligned offset within cache.hdr
+	 * (14-byte Ethernet header, then a 20-byte IP header) — kept in plain
+	 * __u8* + memcpy terms, like the MAC swap above, rather than a typed
+	 * struct iphdr* scalar access: the verifier accepts unaligned access
+	 * through a packet pointer (as _encap.c's new_ip used to rely on) but
+	 * rejects it for a stack buffer like this one. */
+	__u8 *ip_saddr = cache.hdr + sizeof(struct ethhdr) + __builtin_offsetof(struct iphdr, saddr);
+	__u8 *ip_daddr = cache.hdr + sizeof(struct ethhdr) + __builtin_offsetof(struct iphdr, daddr);
+
+	__u8 saddr_bytes[4], daddr_bytes[4];
+	__builtin_memcpy(saddr_bytes, ip_saddr, 4);
+	__builtin_memcpy(daddr_bytes, ip_daddr, 4);
+	__builtin_memcpy(ip_saddr, daddr_bytes, 4);
+	__builtin_memcpy(ip_daddr, saddr_bytes, 4);
 
 	if (!inner_is_v6)
 		bpf_map_update_elem(&flow_state_v4, &fwd_key4, &cache, BPF_ANY);
@@ -322,7 +350,7 @@ int decap(struct xdp_md *ctx)
 
 	/* Strip everything through the GENEVE options, then reopen room for a
 	 * synthesized L2 header, leaving [new eth hdr][inner IP packet]. */
-	if (bpf_xdp_adjust_head(ctx, (int)(outer_len - sizeof(struct ethhdr)))) {
+	if (bpf_xdp_adjust_head(ctx, (int)(OUTER_HDR_LEN - sizeof(struct ethhdr)))) {
 		increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_PACKETS, 1);
 		increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 		return XDP_DROP;

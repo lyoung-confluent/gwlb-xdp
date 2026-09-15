@@ -46,6 +46,16 @@ struct geneve_opt_hdr {
 #define GWLB_OPT_ATTACHMENT_LEN		8
 #define GWLB_OPT_COOKIE_LEN		4
 
+/*
+ * decap assumes every GWLB packet carries exactly these three options, each
+ * a 4-byte geneve_opt_hdr plus its fixed-length data, in exactly this order
+ * — not a generic options walk. GWLB_OPTS_LEN is the resulting fixed total
+ * (12 + 12 + 8 = 32 bytes), and is itself part of OUTER_HDR_LEN below.
+ */
+#define GWLB_OPTS_LEN ( \
+	3 * sizeof(struct geneve_opt_hdr) + \
+	GWLB_OPT_ENI_LEN + GWLB_OPT_ATTACHMENT_LEN + GWLB_OPT_COOKIE_LEN)
+
 #define GENEVE_PORT			6081
 
 /* Constants from <linux/if_ether.h>/<linux/in.h>, which can't be included
@@ -58,20 +68,12 @@ struct geneve_opt_hdr {
 #define IPPROTO_UDP			17
 
 /*
- * Upper bound on GENEVE option bytes decap walks (its unrolled loop runs
- * MAX_GENEVE_OPT_BYTES/4 times). Real GWLB traffic carries 3 options = 32
- * bytes; 40 leaves one extra option's headroom.
- *
- * This is a verifier limit, not a traffic estimate: each step up adds another
- * unrolled copy of the parsing logic, and 48 (12 iterations) already exceeds
- * the verifier's 1M-instruction budget while 40 (10 iterations) loads (checked
- * via `make verify` in the dev container). Raising this requires re-checking
- * against the verifier.
+ * eth(14) + ip(20) + udp(8) + geneve(8) + opts(32): with decap assuming
+ * exactly the three fixed-length GWLB options above, every piece of the
+ * outer header is now a compile-time constant rather than a bound, so this
+ * is an exact size, not a cap.
  */
-#define MAX_GENEVE_OPT_BYTES		40
-
-/* eth(14) + ip(20) + udp(8) + geneve(8) + opts(40), rounded up to 16. */
-#define MAX_OUTER_HDR_BYTES		96
+#define OUTER_HDR_LEN			82
 
 /*
  * Inner 5-tuple, IPv4. Separate struct+map from the IPv6 version rather than
@@ -99,12 +101,22 @@ struct flow_key_v6 {
 	__u8	pad[3];
 };
 
-/* Cached outer eth+ip+udp+geneve(+opts) header, replayed verbatim on encap
- * except for recomputed fields (see _encap.c). Shared by v4 and v6 inner
- * flows — the outer header doesn't vary with the inner address family. */
+/*
+ * Cached outer eth+ip+udp+geneve+opts header, stored by decap with its
+ * Ethernet dst/src and IP saddr/daddr already swapped into reply orientation
+ * (see _decap.c) so encap can replay it onto the wire completely unmodified
+ * — only fields that depend on that specific reply's own size (IP/UDP
+ * length, IP checksum) still get touched, in _encap.c, after the replay.
+ * Shared by v4 and v6 inner flows — the outer header doesn't vary with the
+ * inner address family.
+ *
+ * This box's own hwaddr for the reply needs no separately configured
+ * uplink MAC: it's simply whichever address the original request was
+ * itself addressed to, which the swap above already turns into the
+ * reply's source.
+ */
 struct outer_hdr_cache {
-	__u16	len;
-	__u8	hdr[MAX_OUTER_HDR_BYTES];
+	__u8	hdr[OUTER_HDR_LEN];
 };
 
 /*

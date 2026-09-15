@@ -80,17 +80,6 @@ func Load(cfg Config) (*Program, error) {
 		}
 	}
 
-	// Six scalars rather than one array-typed global — see their doc
-	// comment in bpf/encap/_encap.c for why.
-	uplinkMacVars := [6]string{
-		bpfVarUplinkMac0, bpfVarUplinkMac1, bpfVarUplinkMac2,
-		bpfVarUplinkMac3, bpfVarUplinkMac4, bpfVarUplinkMac5,
-	}
-	for idx, b := range cfg.Uplink.HardwareAddr {
-		if err := spec.Variables[uplinkMacVars[idx]].Set(b); err != nil {
-			return nil, fmt.Errorf("(*ebpf.VariableSpec).Set for %s failed: %w", uplinkMacVars[idx], err)
-		}
-	}
 	if err := spec.Variables[bpfVarUplinkIfindex].Set(uint32(cfg.Uplink.Index)); err != nil {
 		return nil, fmt.Errorf("(*ebpf.VariableSpec).Set for uplink_ifindex failed: %w", err)
 	}

@@ -43,8 +43,7 @@ type bpfMetricKey struct {
 
 type bpfOuterHdrCache struct {
 	_   structs.HostLayout
-	Len uint16
-	Hdr [96]uint8
+	Hdr [82]uint8
 }
 
 // Names of all BPF objects in the ELF.
@@ -59,12 +58,6 @@ const (
 	bpfVarIpv4Enabled   = "ipv4_enabled"
 	bpfVarIpv6Enabled   = "ipv6_enabled"
 	bpfVarUplinkIfindex = "uplink_ifindex"
-	bpfVarUplinkMac0    = "uplink_mac_0"
-	bpfVarUplinkMac1    = "uplink_mac_1"
-	bpfVarUplinkMac2    = "uplink_mac_2"
-	bpfVarUplinkMac3    = "uplink_mac_3"
-	bpfVarUplinkMac4    = "uplink_mac_4"
-	bpfVarUplinkMac5    = "uplink_mac_5"
 )
 
 // loadBpf returns the embedded CollectionSpec for bpf.
@@ -129,12 +122,6 @@ type bpfVariableSpecs struct {
 	Ipv4Enabled   *ebpf.VariableSpec `ebpf:"ipv4_enabled"`
 	Ipv6Enabled   *ebpf.VariableSpec `ebpf:"ipv6_enabled"`
 	UplinkIfindex *ebpf.VariableSpec `ebpf:"uplink_ifindex"`
-	UplinkMac0    *ebpf.VariableSpec `ebpf:"uplink_mac_0"`
-	UplinkMac1    *ebpf.VariableSpec `ebpf:"uplink_mac_1"`
-	UplinkMac2    *ebpf.VariableSpec `ebpf:"uplink_mac_2"`
-	UplinkMac3    *ebpf.VariableSpec `ebpf:"uplink_mac_3"`
-	UplinkMac4    *ebpf.VariableSpec `ebpf:"uplink_mac_4"`
-	UplinkMac5    *ebpf.VariableSpec `ebpf:"uplink_mac_5"`
 }
 
 // bpfObjects contains all objects after they have been loaded into the kernel.
@@ -178,12 +165,6 @@ type bpfVariables struct {
 	Ipv4Enabled   *ebpf.Variable `ebpf:"ipv4_enabled"`
 	Ipv6Enabled   *ebpf.Variable `ebpf:"ipv6_enabled"`
 	UplinkIfindex *ebpf.Variable `ebpf:"uplink_ifindex"`
-	UplinkMac0    *ebpf.Variable `ebpf:"uplink_mac_0"`
-	UplinkMac1    *ebpf.Variable `ebpf:"uplink_mac_1"`
-	UplinkMac2    *ebpf.Variable `ebpf:"uplink_mac_2"`
-	UplinkMac3    *ebpf.Variable `ebpf:"uplink_mac_3"`
-	UplinkMac4    *ebpf.Variable `ebpf:"uplink_mac_4"`
-	UplinkMac5    *ebpf.Variable `ebpf:"uplink_mac_5"`
 }
 
 // bpfPrograms contains all programs after they have been loaded into the kernel.
