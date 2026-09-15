@@ -10,7 +10,7 @@
  * there's no inner L2 header to preserve). All three are decap-only and looked
  * up together, so they're folded into one value for one hash lookup.
  *
- * ifindex also scopes flow_state entries to this ENI (see struct flow_key_v4).
+ * ifindex also scopes flow_state entries to this ENI (see struct flow_key).
  */
 struct eni_info {
 	__u32	ifindex;	/* veth-outer ifindex */
@@ -66,14 +66,15 @@ static __always_inline void *parse_gwlb_opt(__u8 **pos, void *data_end,
 }
 
 /* Per-address-family enable flags, set by the loader before load (default:
- * both enabled). A disabled family's flow_state map is shrunk to one entry;
- * inner packets of that family are dropped before any flow_state access.
+ * both enabled). A disabled family's inner packets are dropped before ever
+ * touching flow_state (shared by both families — see maps.h — so there's
+ * no per-family map to shrink the way there once was).
  * const volatile so the verifier treats them as constant once .rodata is
  * frozen, without constant-folding the pre-load default. */
 const volatile __u8 ipv4_enabled = 1;
 const volatile __u8 ipv6_enabled = 1;
 
-/* build_flow_key_v4/v6 live in geneve_defs.h, shared with encap. */
+/* build_flow_key lives in geneve_defs.h, shared with encap. */
 
 SEC("xdp")
 int decap(struct xdp_md *ctx)
@@ -213,8 +214,7 @@ int decap(struct xdp_md *ctx)
 		return XDP_DROP;
 	}
 
-	/* Family disabled at load time — drop before touching its shrunk
-	 * flow_state map. */
+	/* Family disabled at load time — drop before touching flow_state. */
 	if ((inner_is_v6 && !ipv6_enabled) || (!inner_is_v6 && !ipv4_enabled)) {
 		increment_metric(ifindex, DECAP_CNT_DROP_FAMILY_DISABLED_PACKETS, 1);
 		increment_metric(ifindex, DECAP_CNT_DROP_FAMILY_DISABLED_BYTES, frame_len);
@@ -222,12 +222,11 @@ int decap(struct xdp_md *ctx)
 	}
 
 	__u16 inner_sport = 0, inner_dport = 0;
-	__u32 v4_saddr = 0, v4_daddr = 0;
-	struct in6_addr v6_saddr, v6_daddr;
+	union flow_addr saddr, daddr;
 	__u8 inner_proto = 0;
 
-	__builtin_memset(&v6_saddr, 0, sizeof(v6_saddr));
-	__builtin_memset(&v6_daddr, 0, sizeof(v6_daddr));
+	__builtin_memset(&saddr, 0, sizeof(saddr));
+	__builtin_memset(&daddr, 0, sizeof(daddr));
 
 	if (!inner_is_v6) {
 		struct iphdr *inner_ip = (void *)opt_end;
@@ -258,8 +257,8 @@ int decap(struct xdp_md *ctx)
 			inner_dport = l4hdr->dest;
 		}
 		/* ICMP and others: ports left 0, flow keyed on addrs+proto. */
-		v4_saddr = inner_ip->saddr;
-		v4_daddr = inner_ip->daddr;
+		saddr.v4 = inner_ip->saddr;
+		daddr.v4 = inner_ip->daddr;
 		inner_proto = inner_ip->protocol;
 	} else {
 		struct ipv6hdr *inner_ip6 = (void *)opt_end;
@@ -282,8 +281,8 @@ int decap(struct xdp_md *ctx)
 			inner_sport = l4hdr->source;
 			inner_dport = l4hdr->dest;
 		}
-		v6_saddr = inner_ip6->saddr;
-		v6_daddr = inner_ip6->daddr;
+		__builtin_memcpy(saddr.v6, &inner_ip6->saddr, 16);
+		__builtin_memcpy(daddr.v6, &inner_ip6->daddr, 16);
 		inner_proto = inner_ip6->nexthdr;
 	}
 
@@ -292,15 +291,9 @@ int decap(struct xdp_md *ctx)
 	 * encap doesn't guess — its eni_mode .rodata flag (bpf/encap/_encap.c)
 	 * fixes this box's orientation at load time, so it looks up exactly
 	 * one. */
-	struct flow_key_v4 fwd_key4;
-	struct flow_key_v6 fwd_key6;
-
-	if (!inner_is_v6)
-		build_flow_key_v4(&fwd_key4, ifindex, v4_saddr, v4_daddr,
-				inner_sport, inner_dport, inner_proto);
-	else
-		build_flow_key_v6(&fwd_key6, ifindex, &v6_saddr, &v6_daddr,
-				   inner_sport, inner_dport, inner_proto);
+	struct flow_key fwd_key;
+	build_flow_key(&fwd_key, ifindex, inner_is_v6, saddr, daddr,
+		       inner_sport, inner_dport, inner_proto);
 
 	/* eth+ip+udp+geneve+opts is now OUTER_HDR_LEN exactly — opt_len was
 	 * just verified to be GWLB_OPTS_LEN, not merely bounded by it — so the
@@ -343,10 +336,7 @@ int decap(struct xdp_md *ctx)
 	__builtin_memcpy(ip_saddr, daddr_bytes, 4);
 	__builtin_memcpy(ip_daddr, saddr_bytes, 4);
 
-	if (!inner_is_v6)
-		bpf_map_update_elem(&flow_state_v4, &fwd_key4, &cache, BPF_ANY);
-	else
-		bpf_map_update_elem(&flow_state_v6, &fwd_key6, &cache, BPF_ANY);
+	bpf_map_update_elem(&flow_state, &fwd_key, &cache, BPF_ANY);
 
 	/* Strip everything through the GENEVE options, then reopen room for a
 	 * synthesized L2 header, leaving [new eth hdr][inner IP packet]. */

@@ -13,26 +13,24 @@ import (
 	"github.com/cilium/ebpf"
 )
 
-type bpfFlowKeyV4 struct {
+type bpfFlowKey struct {
 	_       structs.HostLayout
 	Ifindex uint32
-	Saddr   uint32
-	Daddr   uint32
-	Sport   uint16
-	Dport   uint16
-	Proto   uint8
-	Pad     [3]uint8
-}
-
-type bpfFlowKeyV6 struct {
-	_       structs.HostLayout
-	Ifindex uint32
-	Saddr   [16]uint8
-	Daddr   [16]uint8
-	Sport   uint16
-	Dport   uint16
-	Proto   uint8
-	Pad     [3]uint8
+	Saddr   struct {
+		_  structs.HostLayout
+		V4 uint32
+		_  [12]byte
+	}
+	Daddr struct {
+		_  structs.HostLayout
+		V4 uint32
+		_  [12]byte
+	}
+	Sport uint16
+	Dport uint16
+	Proto uint8
+	IsV6  uint8
+	Pad   [2]uint8
 }
 
 type bpfMetricKey struct {
@@ -50,8 +48,7 @@ type bpfOuterHdrCache struct {
 //
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
-	bpfMapFlowStateV4   = "flow_state_v4"
-	bpfMapFlowStateV6   = "flow_state_v6"
+	bpfMapFlowState     = "flow_state"
 	bpfMapMetrics       = "metrics"
 	bpfProgEncap        = "encap"
 	bpfVarEniMode       = "eni_mode"
@@ -109,9 +106,8 @@ type bpfProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfMapSpecs struct {
-	FlowStateV4 *ebpf.MapSpec `ebpf:"flow_state_v4"`
-	FlowStateV6 *ebpf.MapSpec `ebpf:"flow_state_v6"`
-	Metrics     *ebpf.MapSpec `ebpf:"metrics"`
+	FlowState *ebpf.MapSpec `ebpf:"flow_state"`
+	Metrics   *ebpf.MapSpec `ebpf:"metrics"`
 }
 
 // bpfVariableSpecs contains global variables before they are loaded into the kernel.
@@ -144,15 +140,13 @@ func (o *bpfObjects) Close() error {
 //
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfMaps struct {
-	FlowStateV4 *ebpf.Map `ebpf:"flow_state_v4"`
-	FlowStateV6 *ebpf.Map `ebpf:"flow_state_v6"`
-	Metrics     *ebpf.Map `ebpf:"metrics"`
+	FlowState *ebpf.Map `ebpf:"flow_state"`
+	Metrics   *ebpf.Map `ebpf:"metrics"`
 }
 
 func (m *bpfMaps) Close() error {
 	return _BpfClose(
-		m.FlowStateV4,
-		m.FlowStateV6,
+		m.FlowState,
 		m.Metrics,
 	)
 }

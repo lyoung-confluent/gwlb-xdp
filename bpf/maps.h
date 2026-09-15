@@ -5,22 +5,23 @@
 #include "bpf_helpers_min.h"
 #include "geneve_defs.h"
 
+/*
+ * One LRU hash for both address families (struct flow_key tags which —
+ * see geneve_defs.h) rather than a flow_state_v4/v6 pair: less map-value
+ * space wasted on a v4 entry's unused address bytes than two full-width
+ * maps would need doubled up, at the cost of v4 and v6 flows now sharing
+ * one eviction budget instead of each having its own guaranteed capacity —
+ * a burst of one family's traffic can now evict the other's entries,
+ * which two separate maps never allowed.
+ */
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, 1); /* Resized during setup */
-	__type(key, struct flow_key_v4);
+	__type(key, struct flow_key);
 	__type(value, struct outer_hdr_cache);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 	__uint(map_flags, 0); /* shared by encap and decap */
-} flow_state_v4 SEC(".maps");
-struct {
-	__uint(type, BPF_MAP_TYPE_LRU_HASH);
-	__uint(max_entries, 1); /* resized during setup cmd */
-	__type(key, struct flow_key_v6);
-	__type(value, struct outer_hdr_cache);
-	__uint(pinning, LIBBPF_PIN_BY_NAME);
-	__uint(map_flags, 0); /* shared by encap and decap */
-} flow_state_v6 SEC(".maps");
+} flow_state SEC(".maps");
 
 enum metric {
 	DECAP_CNT_PASS_NOT_GENEVE_PACKETS = 0,

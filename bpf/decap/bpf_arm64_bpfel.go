@@ -20,26 +20,24 @@ type bpfEniInfo struct {
 	Src     [6]uint8
 }
 
-type bpfFlowKeyV4 struct {
+type bpfFlowKey struct {
 	_       structs.HostLayout
 	Ifindex uint32
-	Saddr   uint32
-	Daddr   uint32
-	Sport   uint16
-	Dport   uint16
-	Proto   uint8
-	Pad     [3]uint8
-}
-
-type bpfFlowKeyV6 struct {
-	_       structs.HostLayout
-	Ifindex uint32
-	Saddr   [16]uint8
-	Daddr   [16]uint8
-	Sport   uint16
-	Dport   uint16
-	Proto   uint8
-	Pad     [3]uint8
+	Saddr   struct {
+		_  structs.HostLayout
+		V4 uint32
+		_  [12]byte
+	}
+	Daddr struct {
+		_  structs.HostLayout
+		V4 uint32
+		_  [12]byte
+	}
+	Sport uint16
+	Dport uint16
+	Proto uint8
+	IsV6  uint8
+	Pad   [2]uint8
 }
 
 type bpfMetricKey struct {
@@ -58,8 +56,7 @@ type bpfOuterHdrCache struct {
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
 	bpfMapEniToIfindex = "eni_to_ifindex"
-	bpfMapFlowStateV4  = "flow_state_v4"
-	bpfMapFlowStateV6  = "flow_state_v6"
+	bpfMapFlowState    = "flow_state"
 	bpfMapMetrics      = "metrics"
 	bpfProgDecap       = "decap"
 	bpfVarIpv4Enabled  = "ipv4_enabled"
@@ -116,8 +113,7 @@ type bpfProgramSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfMapSpecs struct {
 	EniToIfindex *ebpf.MapSpec `ebpf:"eni_to_ifindex"`
-	FlowStateV4  *ebpf.MapSpec `ebpf:"flow_state_v4"`
-	FlowStateV6  *ebpf.MapSpec `ebpf:"flow_state_v6"`
+	FlowState    *ebpf.MapSpec `ebpf:"flow_state"`
 	Metrics      *ebpf.MapSpec `ebpf:"metrics"`
 }
 
@@ -150,16 +146,14 @@ func (o *bpfObjects) Close() error {
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfMaps struct {
 	EniToIfindex *ebpf.Map `ebpf:"eni_to_ifindex"`
-	FlowStateV4  *ebpf.Map `ebpf:"flow_state_v4"`
-	FlowStateV6  *ebpf.Map `ebpf:"flow_state_v6"`
+	FlowState    *ebpf.Map `ebpf:"flow_state"`
 	Metrics      *ebpf.Map `ebpf:"metrics"`
 }
 
 func (m *bpfMaps) Close() error {
 	return _BpfClose(
 		m.EniToIfindex,
-		m.FlowStateV4,
-		m.FlowStateV6,
+		m.FlowState,
 		m.Metrics,
 	)
 }

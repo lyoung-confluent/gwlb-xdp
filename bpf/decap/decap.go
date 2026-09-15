@@ -24,10 +24,11 @@ const PinLink = bpf.PinDir + "/link_" + bpfProgDecap
 type Config struct {
 	// MaxENIs sizes eni_to_ifindex and metrics.
 	MaxENIs uint32
-	// MaxFlowsV4/V6 size flow_state_v4/v6; <=1 disables that family. A
-	// disabled family's map is still created (the program needs it to
-	// exist even though it never touches it), just clamped to 1 entry
-	// instead of the full preallocated LRU.
+	// MaxFlowsV4/V6 together size the one shared flow_state map (their
+	// sum, each floored at 1); <=1 for either disables that family's own
+	// traffic before it ever touches the map, so a disabled family
+	// contributes only its floor of 1 to the total regardless of what's
+	// requested for it.
 	MaxFlowsV4 uint32
 	MaxFlowsV6 uint32
 }
@@ -49,8 +50,7 @@ func Load(cfg Config) (*Program, error) {
 	}
 
 	spec.Maps[bpfMapEniToIfindex].MaxEntries = cfg.MaxENIs
-	spec.Maps[bpfMapFlowStateV4].MaxEntries = max(cfg.MaxFlowsV4, 1)
-	spec.Maps[bpfMapFlowStateV6].MaxEntries = max(cfg.MaxFlowsV6, 1)
+	spec.Maps[bpfMapFlowState].MaxEntries = max(cfg.MaxFlowsV4, 1) + max(cfg.MaxFlowsV6, 1)
 	spec.Maps[bpfMapMetrics].MaxEntries *= (cfg.MaxENIs + 1)
 
 	// ipv4_enabled/ipv6_enabled default to true in the compiled object
@@ -143,7 +143,7 @@ func AddENI(gwlbID uint64, ifindex uint32, dstMac, srcMac net.HardwareAddr) erro
 }
 
 // RemoveENI deletes gwlbID's entry from eni_to_ifindex and sweeps its
-// flow_state_v4/v6 cache entries and metrics rows by ifindex (a recycled veth
+// flow_state cache entries and metrics rows by ifindex (a recycled veth
 // ifindex could otherwise match stale flow entries before the LRU ages them
 // out, and stale metrics would keep being scraped). It returns the entry as it
 // stood before deletion, so the caller can detach anything keyed on its
@@ -169,8 +169,7 @@ func RemoveENI(gwlbID uint64) (EniInfo, error) {
 	}
 
 	sweepErr := errors.Join(
-		bpf.FlowStateRemove(false, info.Ifindex),
-		bpf.FlowStateRemove(true, info.Ifindex),
+		bpf.FlowStateRemove(info.Ifindex),
 		bpf.MetricsRemove(info.Ifindex),
 	)
 	return info, sweepErr

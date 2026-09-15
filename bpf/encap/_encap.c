@@ -88,8 +88,7 @@ int encap(struct xdp_md *ctx)
 	else
 		return XDP_PASS;
 
-	/* Family disabled at load time — drop before the shrunk flow_state
-	 * lookup. */
+	/* Family disabled at load time — drop before touching flow_state. */
 	if ((is_v6 && !ipv6_enabled) || (!is_v6 && !ipv4_enabled)) {
 		increment_metric(ifindex, ENCAP_CNT_DROP_FAMILY_DISABLED_PACKETS, 1);
 		increment_metric(ifindex, ENCAP_CNT_DROP_FAMILY_DISABLED_BYTES, frame_len);
@@ -98,7 +97,10 @@ int encap(struct xdp_md *ctx)
 
 	__u16 sport = 0, dport = 0;
 	__u8 proto = 0;
-	struct outer_hdr_cache *cache_p = NULL;
+	union flow_addr saddr, daddr;
+
+	__builtin_memset(&saddr, 0, sizeof(saddr));
+	__builtin_memset(&daddr, 0, sizeof(daddr));
 
 	if (!is_v6) {
 		struct iphdr *ip = (void *)(eth + 1);
@@ -127,20 +129,8 @@ int encap(struct xdp_md *ctx)
 			dport = l4hdr->dest;
 		}
 		proto = ip->protocol;
-
-		/* transparent: reply matches the cached tuple literally.
-		 * Otherwise (NAT/SNAT) it comes back with src/dst swapped. The
-		 * shared builder guarantees the key (padding included) is formed
-		 * exactly as decap formed it. */
-		struct flow_key_v4 key;
-		if (transparent)
-			build_flow_key_v4(&key, ifindex, ip->saddr, ip->daddr,
-					  sport, dport, proto);
-		else
-			build_flow_key_v4(&key, ifindex, ip->daddr, ip->saddr,
-					  dport, sport, proto);
-
-		cache_p = bpf_map_lookup_elem(&flow_state_v4, &key);
+		saddr.v4 = ip->saddr;
+		daddr.v4 = ip->daddr;
 	} else {
 		struct ipv6hdr *ip6 = (void *)(eth + 1);
 
@@ -162,18 +152,22 @@ int encap(struct xdp_md *ctx)
 			dport = l4hdr->dest;
 		}
 		proto = ip6->nexthdr;
-
-		/* transparent picks literal vs. swapped — see the v4 path. */
-		struct flow_key_v6 key6;
-		if (transparent)
-			build_flow_key_v6(&key6, ifindex, &ip6->saddr, &ip6->daddr,
-					  sport, dport, proto);
-		else
-			build_flow_key_v6(&key6, ifindex, &ip6->daddr, &ip6->saddr,
-					  dport, sport, proto);
-
-		cache_p = bpf_map_lookup_elem(&flow_state_v6, &key6);
+		__builtin_memcpy(saddr.v6, &ip6->saddr, 16);
+		__builtin_memcpy(daddr.v6, &ip6->daddr, 16);
 	}
+
+	/* transparent: reply matches the cached tuple literally. Otherwise
+	 * (NAT/SNAT) it comes back with src/dst (and port) swapped from what
+	 * decap cached. saddr/daddr being family-agnostic by this point (see
+	 * union flow_addr) means this swap, unlike the parsing above, doesn't
+	 * need its own v4/v6 copy — one shared builder call either way. */
+	struct flow_key key;
+	if (transparent)
+		build_flow_key(&key, ifindex, is_v6, saddr, daddr, sport, dport, proto);
+	else
+		build_flow_key(&key, ifindex, is_v6, daddr, saddr, dport, sport, proto);
+
+	struct outer_hdr_cache *cache_p = bpf_map_lookup_elem(&flow_state, &key);
 
 	if (!cache_p) {
 		/* Response for a flow this box never decapped. */

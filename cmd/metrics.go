@@ -90,18 +90,13 @@ func MetricsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	fmt.Fprintln(w, "# HELP gwlb_xdp_flow_cache_entries Current number of entries in the flow_state cache map, by address family. A family disabled at setup is omitted.")
+	fmt.Fprintln(w, "# HELP gwlb_xdp_flow_cache_entries Current number of entries in the shared flow_state cache map, by address family. A family disabled at setup simply never has any entries.")
 	fmt.Fprintln(w, "# TYPE gwlb_xdp_flow_cache_entries gauge")
-	if count, enabled, err := bpf.FlowStateEntries(false); err != nil {
+	if v4Count, v6Count, err := bpf.FlowStateEntries(); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
-	} else if enabled {
-		fmt.Fprintf(w, "gwlb_xdp_flow_cache_entries{family=%q} %d\n", "v4", count)
-	}
-	if count, enabled, err := bpf.FlowStateEntries(true); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	} else if enabled {
-		fmt.Fprintf(w, "gwlb_xdp_flow_cache_entries{family=%q} %d\n", "v6", count)
+	} else {
+		fmt.Fprintf(w, "gwlb_xdp_flow_cache_entries{family=%q} %d\n", "v4", v4Count)
+		fmt.Fprintf(w, "gwlb_xdp_flow_cache_entries{family=%q} %d\n", "v6", v6Count)
 	}
 }

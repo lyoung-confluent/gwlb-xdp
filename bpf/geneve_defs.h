@@ -75,30 +75,33 @@ struct geneve_opt_hdr {
  */
 #define OUTER_HDR_LEN			82
 
-/*
- * Inner 5-tuple, IPv4. Separate struct+map from the IPv6 version rather than
- * one struct with a 16-byte address: no wasted map-value space, no version tag.
- */
-struct flow_key_v4 {
-	__u32	ifindex;	/* folds tenant identity into the key; see maps.h */
-	__u32	saddr;
-	__u32	daddr;
-	__u16	sport;
-	__u16	dport;
-	__u8	proto;
-	__u8	pad[3];
+/* An inner packet's address, either family — a plain __u32 for v4, or the
+ * full 16 bytes for v6. Which one's live is struct flow_key's own is_v6,
+ * not a tag here: build_flow_key always zeroes the key first and then
+ * copies only the bytes that family actually uses, so a v4 address's
+ * unused upper 12 bytes are deterministically zero rather than whatever
+ * was sitting in the caller's union, and can never alias a real v6 one. */
+union flow_addr {
+	__u32	v4;
+	__u8	v6[16];
 };
 
-/* Inner 5-tuple, IPv6 — same shape, addresses widened to 16 bytes. This is the
- * inner packet only; the outer GENEVE tunnel is IPv4 either way. */
-struct flow_key_v6 {
-	__u32	ifindex;
-	__u8	saddr[16];
-	__u8	daddr[16];
-	__u16	sport;
-	__u16	dport;
-	__u8	proto;
-	__u8	pad[3];
+/*
+ * Inner 5-tuple, either address family — one struct/map for both rather
+ * than a separate v4/v6 pair, so a single flow_state map (see maps.h)
+ * serves both; is_v6 disambiguates the union above. ifindex folds tenant
+ * identity into the key (see maps.h). This is the inner packet's own
+ * tuple; the outer GENEVE tunnel is IPv4 either way.
+ */
+struct flow_key {
+	__u32		ifindex;
+	union flow_addr	saddr;
+	union flow_addr	daddr;
+	__u16		sport;
+	__u16		dport;
+	__u8		proto;
+	__u8		is_v6;
+	__u8		pad[2];
 };
 
 /*
@@ -120,35 +123,31 @@ struct outer_hdr_cache {
 };
 
 /*
- * Flow-key constructors, shared by decap (key from the inner packet as
+ * Flow-key constructor, shared by decap (key from the inner packet as
  * forwarded) and encap (pre-swapped tuple for the NAT reply orientation). Kept
  * in one place so both populate the key — padding included — identically; a
  * silent divergence would break every lookup with no error.
+ *
+ * saddr/daddr are taken by value: each is exactly one union flow_addr's
+ * worth of registers/stack, cheap for an __always_inline call, and it
+ * keeps the union (rather than its address) the thing every caller
+ * actually builds — see build_flow_key's callers in _decap.c/_encap.c.
  */
-static __always_inline void build_flow_key_v4(struct flow_key_v4 *key, __u32 ifindex,
-					    __u32 saddr, __u32 daddr,
-					    __u16 sport, __u16 dport,
-					    __u8 proto)
+static __always_inline void build_flow_key(struct flow_key *key, __u32 ifindex,
+					    bool is_v6, union flow_addr saddr,
+					    union flow_addr daddr,
+					    __u16 sport, __u16 dport, __u8 proto)
 {
 	__builtin_memset(key, 0, sizeof(*key));
 	key->ifindex = ifindex;
-	key->saddr = saddr;
-	key->daddr = daddr;
-	key->sport = sport;
-	key->dport = dport;
-	key->proto = proto;
-}
-
-static __always_inline void build_flow_key_v6(struct flow_key_v6 *key, __u32 ifindex,
-					       const struct in6_addr *saddr,
-					       const struct in6_addr *daddr,
-					       __u16 sport, __u16 dport,
-					       __u8 proto)
-{
-	__builtin_memset(key, 0, sizeof(*key));
-	key->ifindex = ifindex;
-	__builtin_memcpy(key->saddr, saddr, 16);
-	__builtin_memcpy(key->daddr, daddr, 16);
+	key->is_v6 = is_v6;
+	if (is_v6) {
+		__builtin_memcpy(key->saddr.v6, saddr.v6, 16);
+		__builtin_memcpy(key->daddr.v6, daddr.v6, 16);
+	} else {
+		key->saddr.v4 = saddr.v4;
+		key->daddr.v4 = daddr.v4;
+	}
 	key->sport = sport;
 	key->dport = dport;
 	key->proto = proto;

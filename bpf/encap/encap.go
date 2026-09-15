@@ -13,13 +13,21 @@ import (
 )
 
 // Config configures encap before it's loaded. The shared maps aren't sized
-// here — Load reads their sizes back from decap's pins (see Load).
+// here — Load reads their sizes back from decap's pins (see Load) — except
+// that MaxFlowsV4/V6 must still match what was passed to decap.Config: with
+// flow_state shared by both families (see bpf/maps.h), its size alone can no
+// longer tell encap which family, if either, decap disabled.
 type Config struct {
 	// Transparent hardcodes every ENI on this box as a transparent
 	// appliance (reply comes back with the same 5-tuple, not swapped).
 	Transparent bool
 	// Uplink is the physical interface encap sends replies out of.
 	Uplink *net.Interface
+	// MaxFlowsV4/V6 must equal whatever was passed to decap.Config: <=1
+	// for either disables that family's own traffic here too, mirroring
+	// decap's ipv4_enabled/ipv6_enabled.
+	MaxFlowsV4 uint32
+	MaxFlowsV6 uint32
 }
 
 // Program is encap, loaded but not yet attached to any interface — pin
@@ -33,8 +41,8 @@ type Program struct {
 const pinProg = bpf.PinDir + "/prog_" + bpfProgEncap
 
 // Load loads encap, configured per cfg. Requires decap.Load to have run
-// first: it sizes its copies of the shared flow_state_v4/v6 and metrics maps
-// to match the pins decap created (see matchPinnedMapSize).
+// first: it sizes its copy of the shared flow_state and metrics maps to
+// match the pins decap created (see matchPinnedMapSize).
 func Load(cfg Config) (*Program, error) {
 	if err := bpf.CreatePinDir(); err != nil {
 		return nil, fmt.Errorf("bpf.CreatePinDir failed: %w", err)
@@ -45,28 +53,22 @@ func Load(cfg Config) (*Program, error) {
 		return nil, fmt.Errorf("loadBpf failed: %w", err)
 	}
 
-	flowsV4, err := matchPinnedMapSize(spec, bpfMapFlowStateV4)
-	if err != nil {
+	if err := matchPinnedMapSize(spec, bpfMapFlowState); err != nil {
 		return nil, err
 	}
-	flowsV6, err := matchPinnedMapSize(spec, bpfMapFlowStateV6)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := matchPinnedMapSize(spec, bpfMapMetrics); err != nil {
+	if err := matchPinnedMapSize(spec, bpfMapMetrics); err != nil {
 		return nil, err
 	}
 
 	// ipv4_enabled/ipv6_enabled default to true in the compiled object
-	// (bpf/encap/_encap.c); only override here to disable one. A disabled
-	// family's flow_state map is the 1-entry placeholder decap.Load leaves
-	// it at — see its doc comment for why that map still gets created.
-	if flowsV4 <= 1 {
+	// (bpf/encap/_encap.c); only override here to disable one — per
+	// cfg.MaxFlowsV4/V6, not flow_state's size (see Config's doc comment).
+	if cfg.MaxFlowsV4 <= 1 {
 		if err := spec.Variables[bpfVarIpv4Enabled].Set(uint8(0)); err != nil {
 			return nil, fmt.Errorf("(*ebpf.VariableSpec).Set for ipv4_enabled failed: %w", err)
 		}
 	}
-	if flowsV6 <= 1 {
+	if cfg.MaxFlowsV6 <= 1 {
 		if err := spec.Variables[bpfVarIpv6Enabled].Set(uint8(0)); err != nil {
 			return nil, fmt.Errorf("(*ebpf.VariableSpec).Set for ipv6_enabled failed: %w", err)
 		}
@@ -95,13 +97,13 @@ func Load(cfg Config) (*Program, error) {
 }
 
 // matchPinnedMapSize resizes spec's map named name to match the same-named
-// map decap.Load already pinned, returning that size (so a disabled family's
-// 1-entry placeholder can be told from a real size without a second lookup).
-func matchPinnedMapSize(spec *ebpf.CollectionSpec, name string) (maxEntries uint32, rerr error) {
+// map decap.Load already pinned — required for LoadAndAssign to attach to
+// that existing pin rather than fail on a size mismatch.
+func matchPinnedMapSize(spec *ebpf.CollectionSpec, name string) (rerr error) {
 	path := bpf.PinDir + "/" + name
 	m, err := ebpf.LoadPinnedMap(path, nil)
 	if err != nil {
-		return 0, fmt.Errorf("ebpf.LoadPinnedMap for %q failed: %w", path, err)
+		return fmt.Errorf("ebpf.LoadPinnedMap for %q failed: %w", path, err)
 	}
 	defer func() {
 		if err := m.Close(); err != nil && rerr == nil {
@@ -109,9 +111,8 @@ func matchPinnedMapSize(spec *ebpf.CollectionSpec, name string) (maxEntries uint
 		}
 	}()
 
-	maxEntries = m.MaxEntries()
-	spec.Maps[name].MaxEntries = maxEntries
-	return maxEntries, nil
+	spec.Maps[name].MaxEntries = m.MaxEntries()
+	return nil
 }
 
 // Pin pins encap at pinProg, not attached to anything — `add` attaches this

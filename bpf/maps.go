@@ -100,47 +100,51 @@ func Metrics() (map[string][]Metric, error) {
 	return byName, nil
 }
 
+// flowKeyIsV6Offset is struct flow_key's is_v6 field's byte offset (native
+// order): ifindex(4) + saddr(16) + daddr(16) + sport(2) + dport(2) +
+// proto(1) — see bpf/geneve_defs.h. Used to tell a raw flow_state key's
+// family apart without decoding the whole struct.
+const flowKeyIsV6Offset = 4 + 16 + 16 + 2 + 2 + 1
+
 // FlowStateEntries returns the number of live entries in the pinned
-// flow_state_v4/v6 map (v6 selects which). enabled is false when that family
-// was disabled at setup (map shrunk to a 1-entry placeholder), count then 0.
-func FlowStateEntries(v6 bool) (count uint64, enabled bool, err error) {
-	mapName := "flow_state_v4"
-	if v6 {
-		mapName = "flow_state_v6"
-	}
-	path := PinDir + "/" + mapName
+// flow_state map, split by address family using each key's own is_v6 tag
+// (v4 and v6 flows share one map — see maps.h — so family isn't a property
+// of which map you asked, only of which entries you find in it). Unlike
+// before v4/v6 shared a map, there's no signal left here for "this family
+// was disabled at setup": a disabled family simply never has any entries,
+// indistinguishable from an enabled-but-idle one.
+func FlowStateEntries() (v4Count, v6Count uint64, err error) {
+	path := PinDir + "/flow_state"
 	m, err := ebpf.LoadPinnedMap(path, nil)
 	if err != nil {
-		return 0, false, fmt.Errorf("ebpf.LoadPinnedMap for %q failed: %w", path, err)
+		return 0, 0, fmt.Errorf("ebpf.LoadPinnedMap for %q failed: %w", path, err)
 	}
 	defer m.Close()
-	if m.MaxEntries() <= 1 {
-		return 0, false, nil
-	}
 
 	// LRU hashes expose no "current size", so count by walking the keys.
 	var key interface{}
 	for {
 		next, err := m.NextKeyBytes(key)
 		if err != nil {
-			return 0, true, fmt.Errorf("(*ebpf.Map).NextKeyBytes for %s failed: %w", m, err)
+			return 0, 0, fmt.Errorf("(*ebpf.Map).NextKeyBytes for %s failed: %w", m, err)
 		}
 		if next == nil {
-			return count, true, nil
+			return v4Count, v6Count, nil
 		}
 		key = next
-		count++
+		if len(next) > flowKeyIsV6Offset && next[flowKeyIsV6Offset] != 0 {
+			v6Count++
+		} else {
+			v4Count++
+		}
 	}
 }
 
-// FlowStateRemove deletes every entry in the pinned flow_state_v4/v6 map (v6
-// selects which) belonging to ifindex — one removed ENI's cached flows.
-func FlowStateRemove(v6 bool, ifindex uint32) error {
-	mapName := "flow_state_v4"
-	if v6 {
-		mapName = "flow_state_v6"
-	}
-	return sweepByIfindex(mapName, ifindex)
+// FlowStateRemove deletes every entry in the pinned flow_state map belonging
+// to ifindex — one removed ENI's cached flows, both address families in the
+// one sweep since flow_state now holds both.
+func FlowStateRemove(ifindex uint32) error {
+	return sweepByIfindex("flow_state", ifindex)
 }
 
 // MetricsRemove deletes every entry in the pinned metrics map belonging to
@@ -152,8 +156,8 @@ func MetricsRemove(ifindex uint32) error {
 
 // sweepByIfindex deletes every entry in the pinned map named mapName whose key
 // begins with ifindex — its first 4 bytes in native byte order, the leading
-// field of both struct flow_key_v4/v6 and struct metric_key. Keys are
-// collected first, then deleted, to avoid mutating the map mid-iteration.
+// field of both struct flow_key and struct metric_key. Keys are collected
+// first, then deleted, to avoid mutating the map mid-iteration.
 //
 // A missing pin is tolerated (returns nil): it just means nothing has been
 // set up yet. Once the map is open, all iteration/delete errors are returned.

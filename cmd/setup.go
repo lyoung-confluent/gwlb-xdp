@@ -30,8 +30,8 @@ func init() {
 	RootCmd.AddCommand(SetupCmd)
 
 	SetupCmd.Flags().Uint32Var(&MaxENIs, "max-enis", MaxENIs, "max concurrent ENIs this box can serve (sizes eni_to_ifindex)")
-	SetupCmd.Flags().Uint32Var(&MaxFlowsV4, "max-flows-v4", MaxFlowsV4, "max concurrent IPv4 flows tracked (sizes flow_state_v4); <=1 disables IPv4")
-	SetupCmd.Flags().Uint32Var(&MaxFlowsV6, "max-flows-v6", MaxFlowsV6, "max concurrent IPv6 flows tracked (sizes flow_state_v6); <=1 disables IPv6")
+	SetupCmd.Flags().Uint32Var(&MaxFlowsV4, "max-flows-v4", MaxFlowsV4, "max concurrent IPv4 flows tracked (added to --max-flows-v6 to size the shared flow_state map); <=1 disables IPv4")
+	SetupCmd.Flags().Uint32Var(&MaxFlowsV6, "max-flows-v6", MaxFlowsV6, "max concurrent IPv6 flows tracked (added to --max-flows-v4 to size the shared flow_state map); <=1 disables IPv6")
 	SetupCmd.Flags().BoolVar(&Transparent, "transparent", Transparent, "hardcode every ENI on this box as a transparent appliance (reply comes back with the same 5-tuple, not swapped)")
 }
 
@@ -66,6 +66,8 @@ func RunSetup(intfName string, maxENIs, maxFlowsV4, maxFlowsV6 uint32, transpare
 	encapProg, err := encap.Load(encap.Config{
 		Transparent: transparent,
 		Uplink:      intf,
+		MaxFlowsV4:  maxFlowsV4,
+		MaxFlowsV6:  maxFlowsV6,
 	})
 	if err != nil {
 		return fmt.Errorf("encap.Load failed: %w", err)
