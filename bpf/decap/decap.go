@@ -24,13 +24,14 @@ const PinLink = bpf.PinDir + "/link_" + bpfProgDecap
 type Config struct {
 	// MaxENIs sizes eni_to_ifindex and metrics.
 	MaxENIs uint32
-	// MaxFlowsV4/V6 together size the one shared flow_state map (their
-	// sum, each floored at 1); <=1 for either disables that family's own
-	// traffic before it ever touches the map, so a disabled family
-	// contributes only its floor of 1 to the total regardless of what's
-	// requested for it.
-	MaxFlowsV4 uint32
-	MaxFlowsV6 uint32
+	// MaxFlows sizes the one shared flow_state map — IPv4 and IPv6 flows
+	// together, not each.
+	MaxFlows uint32
+	// EnableIPv4/V6 gate that family's inner traffic before it ever
+	// touches flow_state; disabling one doesn't shrink MaxFlows; it's a
+	// single map shared by both families regardless of which are enabled.
+	EnableIPv4 bool
+	EnableIPv6 bool
 }
 
 // Program is decap, loaded and pinned under /sys/fs/bpf/gwlb-xdp.
@@ -50,17 +51,17 @@ func Load(cfg Config) (*Program, error) {
 	}
 
 	spec.Maps[bpfMapEniToIfindex].MaxEntries = cfg.MaxENIs
-	spec.Maps[bpfMapFlowState].MaxEntries = max(cfg.MaxFlowsV4, 1) + max(cfg.MaxFlowsV6, 1)
+	spec.Maps[bpfMapFlowState].MaxEntries = max(cfg.MaxFlows, 1)
 	spec.Maps[bpfMapMetrics].MaxEntries *= (cfg.MaxENIs + 1)
 
 	// ipv4_enabled/ipv6_enabled default to true in the compiled object
 	// (bpf/decap/_decap.c); only override here to disable one.
-	if cfg.MaxFlowsV4 <= 1 {
+	if !cfg.EnableIPv4 {
 		if err := spec.Variables[bpfVarIpv4Enabled].Set(uint8(0)); err != nil {
 			return nil, fmt.Errorf("(*ebpf.VariableSpec).Set for ipv4_enabled failed: %w", err)
 		}
 	}
-	if cfg.MaxFlowsV6 <= 1 {
+	if !cfg.EnableIPv6 {
 		if err := spec.Variables[bpfVarIpv6Enabled].Set(uint8(0)); err != nil {
 			return nil, fmt.Errorf("(*ebpf.VariableSpec).Set for ipv6_enabled failed: %w", err)
 		}

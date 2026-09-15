@@ -12,9 +12,9 @@ import (
 	"github.com/lyoung-confluent/gwlb-xdp/bpf"
 )
 
-// Config configures encap before it's loaded. The shared maps aren't sized
-// here — Load reads their sizes back from decap's pins (see Load) — except
-// that MaxFlowsV4/V6 must still match what was passed to decap.Config: with
+// Config configures encap before it's loaded. flow_state/metrics aren't
+// sized here — Load reads their sizes back from decap's pins (see Load) —
+// but EnableIPv4/V6 must still match what was passed to decap.Config: with
 // flow_state shared by both families (see bpf/maps.h), its size alone can no
 // longer tell encap which family, if either, decap disabled.
 type Config struct {
@@ -23,11 +23,11 @@ type Config struct {
 	Transparent bool
 	// Uplink is the physical interface encap sends replies out of.
 	Uplink *net.Interface
-	// MaxFlowsV4/V6 must equal whatever was passed to decap.Config: <=1
-	// for either disables that family's own traffic here too, mirroring
+	// EnableIPv4/V6 must equal what was passed to decap.Config: false for
+	// either disables that family's own traffic here too, mirroring
 	// decap's ipv4_enabled/ipv6_enabled.
-	MaxFlowsV4 uint32
-	MaxFlowsV6 uint32
+	EnableIPv4 bool
+	EnableIPv6 bool
 }
 
 // Program is encap, loaded but not yet attached to any interface — pin
@@ -62,13 +62,13 @@ func Load(cfg Config) (*Program, error) {
 
 	// ipv4_enabled/ipv6_enabled default to true in the compiled object
 	// (bpf/encap/_encap.c); only override here to disable one — per
-	// cfg.MaxFlowsV4/V6, not flow_state's size (see Config's doc comment).
-	if cfg.MaxFlowsV4 <= 1 {
+	// cfg.EnableIPv4/V6, not flow_state's size (see Config's doc comment).
+	if !cfg.EnableIPv4 {
 		if err := spec.Variables[bpfVarIpv4Enabled].Set(uint8(0)); err != nil {
 			return nil, fmt.Errorf("(*ebpf.VariableSpec).Set for ipv4_enabled failed: %w", err)
 		}
 	}
-	if cfg.MaxFlowsV6 <= 1 {
+	if !cfg.EnableIPv6 {
 		if err := spec.Variables[bpfVarIpv6Enabled].Set(uint8(0)); err != nil {
 			return nil, fmt.Errorf("(*ebpf.VariableSpec).Set for ipv6_enabled failed: %w", err)
 		}

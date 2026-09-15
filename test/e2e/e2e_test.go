@@ -105,7 +105,7 @@ func setupUplink(t *testing.T) (uplinkIface, gwlbIface *net.Interface) {
 // would, and registers `teardown` to reverse it.
 func runSetup(t *testing.T, maxENIs uint32) {
 	t.Helper()
-	if err := cmd.RunSetup(uplinkIfName, maxENIs, 64, 1, false); err != nil {
+	if err := cmd.RunSetup(uplinkIfName, maxENIs, 64, true, false, false); err != nil {
 		t.Fatalf("cmd.RunSetup failed: %v", err)
 	}
 	t.Cleanup(func() {
