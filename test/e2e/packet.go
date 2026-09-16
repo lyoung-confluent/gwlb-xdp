@@ -80,6 +80,32 @@ func buildInnerICMPEchoRequest(srcIP, dstIP net.IP, id, seq uint16, payload []by
 	return append([]byte(nil), buf.Bytes()...), nil
 }
 
+// buildInnerUDPv6 serializes an inner IPv6/UDP packet — pass it as
+// requestParams.innerPacket to exercise decap/encap's IPv6 flow path (the
+// is_v6 branch in _decap.c/_encap.c and union flow_addr in geneve_defs.h),
+// which the default IPv4 inner packet buildRequestFrame builds never reaches.
+func buildInnerUDPv6(srcIP, dstIP net.IP, srcPort, dstPort uint16, payload []byte) ([]byte, error) {
+	innerIP := &layers.IPv6{
+		Version:    6,
+		NextHeader: layers.IPProtocolUDP,
+		HopLimit:   64,
+		SrcIP:      srcIP,
+		DstIP:      dstIP,
+	}
+	innerUDP := &layers.UDP{
+		SrcPort: layers.UDPPort(srcPort),
+		DstPort: layers.UDPPort(dstPort),
+	}
+	if err := innerUDP.SetNetworkLayerForChecksum(innerIP); err != nil {
+		return nil, fmt.Errorf("SetNetworkLayerForChecksum for inner IPv6 UDP failed: %w", err)
+	}
+	buf := gopacket.NewSerializeBuffer()
+	if err := gopacket.SerializeLayers(buf, serializeOpts, innerIP, innerUDP, gopacket.Payload(payload)); err != nil {
+		return nil, fmt.Errorf("serializing inner IPv6 UDP packet failed: %w", err)
+	}
+	return append([]byte(nil), buf.Bytes()...), nil
+}
+
 // verifyIPChecksum reports whether hdr — a raw IPv4 header, checksum field
 // included as transmitted — is internally consistent: per RFC 1071, summing
 // every 16-bit word of a header over its own correct checksum folds to all
@@ -113,9 +139,16 @@ type requestParams struct {
 
 	// innerPacket, when set, is used verbatim as the GENEVE payload instead
 	// of building an inner IPv4/UDP packet from the innerSrcIP/innerDstIP/
-	// innerSrcPort/innerDstPort/payload fields above — for a non-UDP inner
-	// protocol, e.g. buildInnerICMPEchoRequest for the ICMP support test.
+	// innerSrcPort/innerDstPort/payload fields above — for a non-UDP or
+	// non-IPv4 inner protocol, e.g. buildInnerICMPEchoRequest for the ICMP
+	// support test or buildInnerUDPv6 for the IPv6 one.
 	innerPacket []byte
+
+	// innerEthertype is the GENEVE header's proto_type — the inner payload's
+	// ethertype, which decap reads to tell IPv4 from IPv6 (see _decap.c). Zero
+	// defaults to IPv4; set it to layers.EthernetTypeIPv6 alongside an
+	// innerPacket built by buildInnerUDPv6.
+	innerEthertype layers.EthernetType
 }
 
 // buildRequestFrame assembles a full Ethernet frame carrying an outer
@@ -149,9 +182,13 @@ func buildRequestFrame(p requestParams) ([]byte, error) {
 		innerBytes = innerBuf.Bytes()
 	}
 
+	innerEthertype := p.innerEthertype
+	if innerEthertype == 0 {
+		innerEthertype = layers.EthernetTypeIPv4
+	}
 	geneve := &layers.Geneve{
 		Version:  p.geneveVer,
-		Protocol: layers.EthernetTypeIPv4,
+		Protocol: innerEthertype,
 		VNI:      uint32(p.vni[0])<<16 | uint32(p.vni[1])<<8 | uint32(p.vni[2]),
 		Options:  p.opts,
 	}
@@ -290,6 +327,68 @@ func parseReply(frame []byte) (*replyPacket, error) {
 		innerDstPort:         uint16(innerUDP.DstPort),
 		innerIPChecksumValid: verifyIPChecksum(innerIP.Contents),
 		payload:              innerUDP.Payload,
+	}, nil
+}
+
+// udpReplyPacketV6 is replyPacket's IPv6 analogue: the outer tunnel is still
+// IPv4 (GWLB always encapsulates over IPv4), but the inner packet is IPv6/UDP.
+type udpReplyPacketV6 struct {
+	outerSrcMAC, outerDstMAC net.HardwareAddr
+	outerSrcIP, outerDstIP   net.IP
+	outerDstPort             uint16
+	outerUDPChecksum         uint16
+	outerIPChecksumValid     bool
+
+	opts []byte
+
+	innerSrcIP, innerDstIP     net.IP
+	innerSrcPort, innerDstPort uint16
+	payload                    []byte
+}
+
+// parseUDPReplyV6 is parseReply's IPv6 analogue: same outer eth/IPv4/UDP/
+// GENEVE shape, but an inner IPv6/UDP packet instead of IPv4/UDP.
+func parseUDPReplyV6(frame []byte) (*udpReplyPacketV6, error) {
+	eth, outerIP, outerUDP, gn, err := decodeOuterFrame(frame)
+	if err != nil {
+		return nil, err
+	}
+	if len(gn.Contents) < 8 {
+		return nil, fmt.Errorf("truncated GENEVE header")
+	}
+	opts := append([]byte(nil), gn.Contents[8:]...)
+
+	innerPacket := gopacket.NewPacket(gn.LayerPayload(), layers.LayerTypeIPv6, gopacket.Default)
+	if errLayer := innerPacket.ErrorLayer(); errLayer != nil {
+		return nil, fmt.Errorf("decoding inner IPv6 packet failed: %w", errLayer.Error())
+	}
+	innerIP, ok := innerPacket.Layer(layers.LayerTypeIPv6).(*layers.IPv6)
+	if !ok {
+		return nil, fmt.Errorf("no inner IPv6 layer")
+	}
+	innerUDP, ok := innerPacket.Layer(layers.LayerTypeUDP).(*layers.UDP)
+	if !ok {
+		return nil, fmt.Errorf("no inner UDP layer")
+	}
+
+	return &udpReplyPacketV6{
+		outerDstMAC: eth.DstMAC,
+		outerSrcMAC: eth.SrcMAC,
+
+		outerSrcIP: outerIP.SrcIP,
+		outerDstIP: outerIP.DstIP,
+
+		outerDstPort:         uint16(outerUDP.DstPort),
+		outerUDPChecksum:     outerUDP.Checksum,
+		outerIPChecksumValid: verifyIPChecksum(outerIP.Contents),
+
+		opts: opts,
+
+		innerSrcIP:   innerIP.SrcIP,
+		innerDstIP:   innerIP.DstIP,
+		innerSrcPort: uint16(innerUDP.SrcPort),
+		innerDstPort: uint16(innerUDP.DstPort),
+		payload:      innerUDP.Payload,
 	}, nil
 }
 

@@ -43,8 +43,6 @@ var CounterNames = []string{
 	"decap_drop_malformed_bytes",
 	"decap_drop_unknown_eni_packets",
 	"decap_drop_unknown_eni_bytes",
-	"decap_drop_hdr_too_long_packets",
-	"decap_drop_hdr_too_long_bytes",
 	"decap_ok_packets",
 	"decap_ok_bytes",
 	"encap_drop_malformed_packets",

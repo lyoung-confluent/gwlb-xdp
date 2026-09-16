@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 
+	"github.com/cilium/ebpf"
 	"github.com/safchain/ethtool"
 	"github.com/spf13/cobra"
 	"github.com/vishvananda/netlink"
@@ -82,6 +83,19 @@ func RunAdd(vpceID string, scriptPath string, isolated bool) (err error) {
 	// so a leaked veth/netns doesn't vanish silently.
 	defer func() {
 		if err != nil {
+			// If AddENI already ran (it's the second-to-last step), its
+			// eni_to_ifindex entry would otherwise outlive the veth we're
+			// about to delete — leaving decap redirecting this ENI's traffic
+			// to a dead (and eventually recycled) ifindex, and blocking any
+			// re-add since AddENI refuses to overwrite. Sweep it too. A
+			// not-yet-inserted entry just isn't found (ErrKeyNotExist), and a
+			// failure so early that setup's map pin doesn't exist yet
+			// (os.ErrNotExist) likewise means there's nothing to undo — neither
+			// is a rollback failure.
+			if _, e := decap.RemoveENI(gwlbID); e != nil &&
+				!errors.Is(e, ebpf.ErrKeyNotExist) && !errors.Is(e, os.ErrNotExist) {
+				err = errors.Join(err, fmt.Errorf("rollback: decap.RemoveENI for %q failed: %w", vpceID, e))
+			}
 			if link, e := netlink.LinkByName(outerName); e == nil {
 				if e := netlink.LinkDel(link); e != nil {
 					err = errors.Join(err, fmt.Errorf("rollback: netlink.LinkDel for %q failed: %w", outerName, e))

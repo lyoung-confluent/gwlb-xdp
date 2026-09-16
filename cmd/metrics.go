@@ -84,8 +84,17 @@ func MetricsHandler(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "# HELP %s %s counted by the gwlb-xdp BPF programs for the %q outcome, by originating interface and CPU. gwlb_id is added when that interface is one of this box's provisioned ENIs; decap events counted before an ENI is resolved are attributed to the uplink interface it's attached to.\n", metric, unit, name)
 		fmt.Fprintf(w, "# TYPE %s counter\n", metric)
 		for _, e := range byName[name] {
+			// An ifindex with no current interface (e.g. a row orphaned by a
+			// veth deleted out-of-band, or a remove whose metrics sweep
+			// failed) has no labels — emitting the series anyway would produce
+			// a syntactically invalid `{,cpu="0"}` line that fails the whole
+			// scrape, so skip it.
+			labels, ok := labelCache[e.Ifindex]
+			if !ok {
+				continue
+			}
 			for cpu, v := range e.PerCPU {
-				fmt.Fprintf(w, "%s{%s,cpu=\"%d\"} %d\n", metric, labelCache[e.Ifindex], cpu, v)
+				fmt.Fprintf(w, "%s{%s,cpu=\"%d\"} %d\n", metric, labels, cpu, v)
 			}
 		}
 	}

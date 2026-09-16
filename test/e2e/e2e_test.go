@@ -10,11 +10,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gopacket/gopacket/layers"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
 	"golang.org/x/sys/unix"
 
 	"github.com/lyoung-confluent/gwlb-xdp/bpf"
+	"github.com/lyoung-confluent/gwlb-xdp/bpf/decap"
 	"github.com/lyoung-confluent/gwlb-xdp/cmd"
 )
 
@@ -36,6 +38,12 @@ const (
 	fakeClientMAC  = "02:00:00:00:00:01"
 	echoServerPort = 17777
 	fakeClientPort = 54321
+
+	// IPv6 counterparts, for the inner-IPv6 data path (TestEndToEndV6).
+	// provisionENI configures these alongside the v4 addressing on every ENI,
+	// so the same backend answers both families.
+	echoServerIP6 = "2001:db8::10"
+	fakeClientIP6 = "2001:db8::1"
 
 	fakeGWLBOuterSrcIP = "198.51.100.1" // stands in for the real GWLB's own IP
 	fakeGWLBOuterDstIP = "198.51.100.2" // stands in for this box's IP
@@ -143,19 +151,38 @@ type eni struct {
 	outerIfindex uint32
 }
 
+// backendAddr describes one address family's worth of an ENI's backend: the
+// echo server's own address, the CIDR to assign it on veth-inner, the client
+// address to pin a permanent neighbor entry for, and the net.ListenUDP network
+// to serve on. provisionENI configures every ENI with both v4 and v6 so the
+// same backend answers either family (see TestEndToEnd vs TestEndToEndV6).
+type backendAddr struct {
+	network  string // "udp4" / "udp6", for net.ListenUDP
+	family   int    // netlink.FAMILY_V4 / netlink.FAMILY_V6, for the neighbor
+	cidr     string // echo address + prefix, e.g. "192.0.2.10/24"
+	echoIP   string
+	clientIP string
+	nodad    bool // skip IPv6 DAD so the address is usable immediately
+}
+
+var backendAddrs = []backendAddr{
+	{"udp4", netlink.FAMILY_V4, echoServerIP + "/24", echoServerIP, fakeClientIP, false},
+	{"udp6", netlink.FAMILY_V6, echoServerIP6 + "/64", echoServerIP6, fakeClientIP6, true},
+}
+
 // provisionENI runs `add` for gwlbID — into a dedicated netns when isolated
 // is true (the normal case), or leaving its veth pair in the root netns
-// (--no-netns) when false — and starts a real UDP echo server on its
-// veth-inner at echoIP:echoPort, standing in for the backend/appliance.
-// Each received datagram's payload is passed through transform before being
-// echoed back, so a test can tell which ENI's backend actually answered —
-// pass bytes.Clone (or similar) for a plain echo.
+// (--no-netns) when false — and starts a real UDP echo server (one per address
+// family, see backendAddrs) on its veth-inner at echoPort, standing in for the
+// backend/appliance. Each received datagram's payload is passed through
+// transform before being echoed back, so a test can tell which ENI's backend
+// actually answered — pass bytes.Clone (or similar) for a plain echo.
 //
-// clientIP gets a permanent (never-ARPed) neighbor entry on the ENI's own
-// veth-inner, mapped to clientMAC: nothing will ever answer ARP for it, so
-// without this the echo server's reply would sit in the kernel's neighbor
-// queue forever instead of ever reaching encap.
-func provisionENI(t *testing.T, gwlbID uint64, isolated bool, echoIP string, echoPort int, clientIP, clientMAC string, transform func([]byte) []byte) eni {
+// Each family's client address gets a permanent (never-ARPed/never-NDP'd)
+// neighbor entry on the ENI's own veth-inner, mapped to clientMAC: nothing
+// will ever answer for it, so without this the echo server's reply would sit
+// in the kernel's neighbor queue forever instead of ever reaching encap.
+func provisionENI(t *testing.T, gwlbID uint64, isolated bool, echoPort int, clientMAC string, transform func([]byte) []byte) eni {
 	t.Helper()
 
 	vpceID := cmd.FormatVPCEID(gwlbID)
@@ -175,25 +202,17 @@ func provisionENI(t *testing.T, gwlbID uint64, isolated bool, echoIP string, ech
 		t.Fatalf("net.InterfaceByName(%q) failed: %v", outerName, err)
 	}
 
-	addr, err := netlink.ParseAddr(echoIP + "/24")
-	if err != nil {
-		t.Fatalf("netlink.ParseAddr failed: %v", err)
-	}
 	clientHW, err := net.ParseMAC(clientMAC)
 	if err != nil {
 		t.Fatalf("net.ParseMAC failed: %v", err)
 	}
-	neigh := &netlink.Neigh{
-		Family:       netlink.FAMILY_V4,
-		State:        netlink.NUD_PERMANENT,
-		IP:           net.ParseIP(clientIP),
-		HardwareAddr: clientHW,
-	}
-	listen := func() (*net.UDPConn, error) {
-		return net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP(echoIP), Port: echoPort})
-	}
 
-	var conn *net.UDPConn
+	// nlh is the netlink handle addressing the inner veth's netns (a dedicated
+	// one when isolated, the root netns otherwise), and inNetns runs fn with
+	// the calling thread switched into that same netns so a socket opened
+	// there lands on the inner veth. For --no-netns both are just "here".
+	var nlh *netlink.Handle
+	inNetns := func(fn func() error) error { return fn() }
 	if isolated {
 		ns, err := netns.GetFromName(vpceID)
 		if err != nil {
@@ -201,70 +220,75 @@ func provisionENI(t *testing.T, gwlbID uint64, isolated bool, echoIP string, ech
 		}
 		t.Cleanup(func() { ns.Close() })
 
-		nsh, err := netlink.NewHandleAt(ns)
+		nlh, err = netlink.NewHandleAt(ns)
 		if err != nil {
 			t.Fatalf("netlink.NewHandleAt failed: %v", err)
 		}
-		t.Cleanup(func() { nsh.Close() })
-
-		innerLink, err := nsh.LinkByName(innerName)
-		if err != nil {
-			t.Fatalf("(*netlink.Handle).LinkByName(%q) failed: %v", innerName, err)
-		}
-		if err := nsh.AddrAdd(innerLink, addr); err != nil {
-			t.Fatalf("(*netlink.Handle).AddrAdd failed: %v", err)
-		}
-		neigh.LinkIndex = innerLink.Attrs().Index
-		if err := nsh.NeighAdd(neigh); err != nil {
-			t.Fatalf("(*netlink.Handle).NeighAdd failed: %v", err)
-		}
-
-		// The listening socket is created *inside* the netns via
-		// cmd.WithNetns, but a socket's netns membership is fixed at
-		// creation time — the goroutine reading/writing it below runs in
-		// the root netns without issue.
-		if err := cmd.WithNetns(ns, func() error {
-			var err error
-			conn, err = listen()
-			return err
-		}); err != nil {
-			t.Fatalf("starting the echo server for %q failed: %v", vpceID, err)
-		}
+		t.Cleanup(func() { nlh.Close() })
+		inNetns = func(fn func() error) error { return cmd.WithNetns(ns, fn) }
 	} else {
-		innerLink, err := netlink.LinkByName(innerName)
+		nlh, err = netlink.NewHandle()
 		if err != nil {
-			t.Fatalf("netlink.LinkByName(%q) failed: %v", innerName, err)
+			t.Fatalf("netlink.NewHandle failed: %v", err)
 		}
-		if err := netlink.AddrAdd(innerLink, addr); err != nil {
-			t.Fatalf("netlink.AddrAdd failed: %v", err)
-		}
-		neigh.LinkIndex = innerLink.Attrs().Index
-		if err := netlink.NeighAdd(neigh); err != nil {
-			t.Fatalf("netlink.NeighAdd failed: %v", err)
-		}
-
-		conn, err = listen()
-		if err != nil {
-			t.Fatalf("starting the echo server for %q failed: %v", vpceID, err)
-		}
+		t.Cleanup(func() { nlh.Close() })
 	}
 
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		buf := make([]byte, 2048)
-		for {
-			n, raddr, err := conn.ReadFromUDP(buf)
-			if err != nil {
-				return
-			}
-			_, _ = conn.WriteToUDP(transform(buf[:n]), raddr)
+	innerLink, err := nlh.LinkByName(innerName)
+	if err != nil {
+		t.Fatalf("(*netlink.Handle).LinkByName(%q) failed: %v", innerName, err)
+	}
+
+	for _, b := range backendAddrs {
+		addr, err := netlink.ParseAddr(b.cidr)
+		if err != nil {
+			t.Fatalf("netlink.ParseAddr(%q) failed: %v", b.cidr, err)
 		}
-	}()
-	t.Cleanup(func() {
-		conn.Close()
-		<-done
-	})
+		if b.nodad {
+			addr.Flags |= unix.IFA_F_NODAD
+		}
+		if err := nlh.AddrAdd(innerLink, addr); err != nil {
+			t.Fatalf("(*netlink.Handle).AddrAdd(%q) failed: %v", b.cidr, err)
+		}
+		if err := nlh.NeighAdd(&netlink.Neigh{
+			LinkIndex:    innerLink.Attrs().Index,
+			Family:       b.family,
+			State:        netlink.NUD_PERMANENT,
+			IP:           net.ParseIP(b.clientIP),
+			HardwareAddr: clientHW,
+		}); err != nil {
+			t.Fatalf("(*netlink.Handle).NeighAdd(%q) failed: %v", b.clientIP, err)
+		}
+
+		// The listening socket is created *inside* the netns via inNetns, but
+		// a socket's netns membership is fixed at creation time — the
+		// goroutine reading/writing it below runs in the root netns fine.
+		var conn *net.UDPConn
+		if err := inNetns(func() error {
+			var err error
+			conn, err = net.ListenUDP(b.network, &net.UDPAddr{IP: net.ParseIP(b.echoIP), Port: echoPort})
+			return err
+		}); err != nil {
+			t.Fatalf("starting the %s echo server for %q failed: %v", b.network, vpceID, err)
+		}
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			buf := make([]byte, 2048)
+			for {
+				n, raddr, err := conn.ReadFromUDP(buf)
+				if err != nil {
+					return
+				}
+				_, _ = conn.WriteToUDP(transform(buf[:n]), raddr)
+			}
+		}()
+		t.Cleanup(func() {
+			conn.Close()
+			<-done
+		})
+	}
 
 	return eni{gwlbID: gwlbID, outerIfindex: uint32(outerIface.Index)}
 }
@@ -488,7 +512,7 @@ func TestEndToEnd(t *testing.T) {
 
 	uplinkIface, gwlbIface := setupUplink(t)
 	runSetup(t, 8)
-	one := provisionENI(t, gwlbID, true, echoServerIP, echoServerPort, fakeClientIP, fakeClientMAC, func(b []byte) []byte { return b })
+	one := provisionENI(t, gwlbID, true, echoServerPort, fakeClientMAC, func(b []byte) []byte { return b })
 	fd := openGWLBSocket(t, gwlbIface)
 
 	payload := []byte("hello from gwlb-xdp e2e test")
@@ -675,8 +699,8 @@ func TestOverlappingCIDRIsolation(t *testing.T) {
 	}
 	// Same echoServerIP:echoServerPort, same fakeClientIP/MAC neighbor entry,
 	// for both ENIs — only their own netns keeps that from colliding.
-	eniA := provisionENI(t, gwlbIDA, true, echoServerIP, echoServerPort, fakeClientIP, fakeClientMAC, tag("A:"))
-	eniB := provisionENI(t, gwlbIDB, true, echoServerIP, echoServerPort, fakeClientIP, fakeClientMAC, tag("B:"))
+	eniA := provisionENI(t, gwlbIDA, true, echoServerPort, fakeClientMAC, tag("A:"))
+	eniB := provisionENI(t, gwlbIDB, true, echoServerPort, fakeClientMAC, tag("B:"))
 	if eniA.outerIfindex == eniB.outerIfindex {
 		t.Fatalf("both ENIs resolved to the same veth-outer ifindex (%d) — test setup is broken", eniA.outerIfindex)
 	}
@@ -733,7 +757,7 @@ func TestNoNetns(t *testing.T) {
 
 	uplinkIface, gwlbIface := setupUplink(t)
 	runSetup(t, 8)
-	one := provisionENI(t, gwlbID, false, echoServerIP, echoServerPort, fakeClientIP, fakeClientMAC, func(b []byte) []byte { return b })
+	one := provisionENI(t, gwlbID, false, echoServerPort, fakeClientMAC, func(b []byte) []byte { return b })
 	fd := openGWLBSocket(t, gwlbIface)
 
 	// Confirm --no-netns actually took: no netns was created for this ENI
@@ -773,7 +797,7 @@ func TestICMPEcho(t *testing.T) {
 
 	uplinkIface, gwlbIface := setupUplink(t)
 	runSetup(t, 8)
-	one := provisionENI(t, gwlbID, true, echoServerIP, echoServerPort, fakeClientIP, fakeClientMAC, func(b []byte) []byte { return b })
+	one := provisionENI(t, gwlbID, true, echoServerPort, fakeClientMAC, func(b []byte) []byte { return b })
 	fd := openGWLBSocket(t, gwlbIface)
 
 	const icmpID, icmpSeq = 0x1234, 1
@@ -840,5 +864,194 @@ func TestICMPEcho(t *testing.T) {
 	}
 	if got := metricSum(t, "encap_ok_packets", one.outerIfindex); got != 1 {
 		t.Errorf("encap_ok_packets[outer ifindex] = %d, want 1", got)
+	}
+}
+
+// waitForReplyV6 is waitForReply's inner-IPv6 analogue — same "tell the reply
+// apart from our own looped-back request by outer source MAC" loop, parsing
+// each frame as an outer-IPv4/inner-IPv6 reply (see parseUDPReplyV6).
+func waitForReplyV6(t *testing.T, fd int, uplinkMAC net.HardwareAddr, timeout time.Duration) *udpReplyPacketV6 {
+	t.Helper()
+	tv := unix.NsecToTimeval(timeout.Nanoseconds())
+	if err := unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &tv); err != nil {
+		t.Fatalf("unix.SetsockoptTimeval failed: %v", err)
+	}
+
+	buf := make([]byte, 2048)
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		n, err := unix.Read(fd, buf)
+		if err != nil {
+			if err == unix.EINTR || err == unix.EAGAIN {
+				continue
+			}
+			t.Fatalf("waiting for a GENEVE IPv6 reply failed: %v", err)
+		}
+		rp, err := parseUDPReplyV6(buf[:n])
+		if err != nil || !bytes.Equal(rp.outerSrcMAC, uplinkMAC) {
+			continue // not it — e.g. our own request, looped back
+		}
+		return rp
+	}
+	return nil
+}
+
+// TestEndToEndV6 is TestEndToEnd's happy path with an inner IPv6/UDP packet
+// instead of IPv4 — exercising decap/encap's is_v6 branch and union flow_addr
+// (bpf/geneve_defs.h), which every other test leaves untouched. The outer
+// GENEVE tunnel is still IPv4 (GWLB always encapsulates over IPv4); only the
+// inner packet, and the GENEVE proto_type decap reads to classify it, are v6.
+func TestEndToEndV6(t *testing.T) {
+	requireRoot(t)
+	_ = unix.Mount("bpf", "/sys/fs/bpf", "bpf", 0, "")
+
+	gwlbID := uint64(0xE2E)
+
+	uplinkIface, gwlbIface := setupUplink(t)
+	runSetup(t, 8)
+	one := provisionENI(t, gwlbID, true, echoServerPort, fakeClientMAC, func(b []byte) []byte { return b })
+	fd := openGWLBSocket(t, gwlbIface)
+
+	payload := []byte("hello from gwlb-xdp e2e test (ipv6)")
+	innerPacket, err := buildInnerUDPv6(net.ParseIP(fakeClientIP6), net.ParseIP(echoServerIP6), fakeClientPort, echoServerPort, payload)
+	if err != nil {
+		t.Fatalf("buildInnerUDPv6 failed: %v", err)
+	}
+	frame, err := buildRequestFrame(requestParams{
+		outerSrcMAC:    gwlbIface.HardwareAddr,
+		outerDstMAC:    uplinkIface.HardwareAddr,
+		outerSrcIP:     net.ParseIP(fakeGWLBOuterSrcIP),
+		outerDstIP:     net.ParseIP(fakeGWLBOuterDstIP),
+		outerSrcPort:   fakeOuterSrcPort,
+		vni:            [3]byte{0, 0, 0},
+		opts:           buildGeneveOptions(gwlbID, fakeAttachmentID, fakeFlowCookie),
+		innerPacket:    innerPacket,
+		innerEthertype: layers.EthernetTypeIPv6,
+	})
+	if err != nil {
+		t.Fatalf("buildRequestFrame failed: %v", err)
+	}
+	if err := unix.Sendto(fd, frame, 0, &unix.SockaddrLinklayer{Ifindex: gwlbIface.Index}); err != nil {
+		t.Fatalf("unix.Sendto failed: %v", err)
+	}
+
+	reply := waitForReplyV6(t, fd, uplinkIface.HardwareAddr, 5*time.Second)
+	if reply == nil {
+		t.Fatal("no GENEVE IPv6 reply observed on the simulated uplink within 5s")
+	}
+
+	// Outer addressing swapped and GENEVE options replayed verbatim, exactly
+	// as the IPv4 case (assertValidReply) — the outer tunnel is family-blind.
+	if !bytes.Equal(reply.outerDstMAC, gwlbIface.HardwareAddr) {
+		t.Errorf("reply outer dst MAC = %v, want %v (this harness's own)", reply.outerDstMAC, gwlbIface.HardwareAddr)
+	}
+	if !reply.outerSrcIP.Equal(net.ParseIP(fakeGWLBOuterDstIP)) || !reply.outerDstIP.Equal(net.ParseIP(fakeGWLBOuterSrcIP)) {
+		t.Errorf("reply outer IPs = %s -> %s, want %s -> %s (swapped)",
+			reply.outerSrcIP, reply.outerDstIP, fakeGWLBOuterDstIP, fakeGWLBOuterSrcIP)
+	}
+	if reply.outerDstPort != genevePort {
+		t.Errorf("reply outer UDP dst port = %d, want %d", reply.outerDstPort, genevePort)
+	}
+	if !reply.outerIPChecksumValid {
+		t.Error("reply outer IP header checksum is invalid (encap's recomputed ipv4_checksum, see _encap.c)")
+	}
+	if reply.outerUDPChecksum != 0 {
+		t.Errorf("reply outer UDP checksum = %#04x, want 0 (zeroed by encap, see _encap.c)", reply.outerUDPChecksum)
+	}
+
+	// Inner IPv6 5-tuple swapped by the echo server's own reply, payload echoed.
+	if !reply.innerSrcIP.Equal(net.ParseIP(echoServerIP6)) || !reply.innerDstIP.Equal(net.ParseIP(fakeClientIP6)) {
+		t.Errorf("reply inner IPs = %s -> %s, want %s -> %s",
+			reply.innerSrcIP, reply.innerDstIP, echoServerIP6, fakeClientIP6)
+	}
+	if reply.innerSrcPort != echoServerPort || reply.innerDstPort != fakeClientPort {
+		t.Errorf("reply inner ports = %d -> %d, want %d -> %d",
+			reply.innerSrcPort, reply.innerDstPort, echoServerPort, fakeClientPort)
+	}
+	if !bytes.Equal(reply.payload, payload) {
+		t.Errorf("reply payload = %q, want %q", reply.payload, payload)
+	}
+
+	if got := metricSum(t, "decap_ok_packets", one.outerIfindex); got != 1 {
+		t.Errorf("decap_ok_packets[outer ifindex] = %d, want 1", got)
+	}
+	if got := metricSum(t, "encap_ok_packets", one.outerIfindex); got != 1 {
+		t.Errorf("encap_ok_packets[outer ifindex] = %d, want 1", got)
+	}
+}
+
+// TestRemove drives one ENI through a full round trip (so its flow_state cache
+// and metrics rows are populated), then `remove`s it and checks that every
+// piece is actually reversed: the eni_to_ifindex entry, the veth pair, the
+// netns, and — the part remove exists to guarantee (see decap.RemoveENI) — the
+// flow_state and metrics entries keyed by the now-freed ifindex, so a later
+// ENI recycling that ifindex can't inherit stale cache hits or counters.
+func TestRemove(t *testing.T) {
+	requireRoot(t)
+	_ = unix.Mount("bpf", "/sys/fs/bpf", "bpf", 0, "")
+
+	gwlbID := uint64(0xE2E)
+	vpceID := cmd.FormatVPCEID(gwlbID)
+	outerName := cmd.FormatInterfaceName(gwlbID, false)
+
+	uplinkIface, gwlbIface := setupUplink(t)
+	runSetup(t, 8)
+	one := provisionENI(t, gwlbID, true, echoServerPort, fakeClientMAC, func(b []byte) []byte { return b })
+	fd := openGWLBSocket(t, gwlbIface)
+
+	// Populate flow_state + metrics for this ENI's ifindex.
+	sendGENEVE(t, fd, uplinkIface, gwlbIface, gwlbID, []byte("populate"))
+	if reply := waitForReply(t, fd, uplinkIface.HardwareAddr, 5*time.Second); reply == nil {
+		t.Fatal("no reply before remove — round trip is broken, nothing to test removal against")
+	}
+	if v4, _, err := bpf.FlowStateEntries(); err != nil {
+		t.Fatalf("bpf.FlowStateEntries failed: %v", err)
+	} else if v4 == 0 {
+		t.Fatal("expected a flow_state entry before remove")
+	}
+	if got := metricSum(t, "decap_ok_packets", one.outerIfindex); got == 0 {
+		t.Fatal("expected decap_ok_packets before remove")
+	}
+
+	if err := cmd.RunRemove(vpceID); err != nil {
+		t.Fatalf("cmd.RunRemove(%q) failed: %v", vpceID, err)
+	}
+
+	// eni_to_ifindex entry gone.
+	ids, err := decap.ProvisionedENIs()
+	if err != nil {
+		t.Fatalf("decap.ProvisionedENIs failed: %v", err)
+	}
+	for _, id := range ids {
+		if id == gwlbID {
+			t.Errorf("ENI %#x still in eni_to_ifindex after remove", gwlbID)
+		}
+	}
+
+	// veth pair gone (deleting the outer end takes the inner peer with it).
+	if _, err := net.InterfaceByName(outerName); err == nil {
+		t.Errorf("veth %q still exists after remove", outerName)
+	}
+
+	// netns gone.
+	if ns, err := netns.GetFromName(vpceID); err == nil {
+		ns.Close()
+		t.Errorf("netns %q still exists after remove", vpceID)
+	}
+
+	// flow_state swept — the whole point of remove's sweep (see decap.RemoveENI).
+	if v4, v6, err := bpf.FlowStateEntries(); err != nil {
+		t.Fatalf("bpf.FlowStateEntries failed: %v", err)
+	} else if v4 != 0 || v6 != 0 {
+		t.Errorf("flow_state not swept after remove: v4=%d v6=%d, want 0/0", v4, v6)
+	}
+
+	// metrics rows for the freed ifindex swept, so a scrape stops emitting
+	// series for an interface that no longer exists.
+	if got := metricSum(t, "decap_ok_packets", one.outerIfindex); got != 0 {
+		t.Errorf("decap_ok_packets[freed ifindex] = %d after remove, want 0 (metrics not swept)", got)
+	}
+	if got := metricSum(t, "encap_ok_packets", one.outerIfindex); got != 0 {
+		t.Errorf("encap_ok_packets[freed ifindex] = %d after remove, want 0 (metrics not swept)", got)
 	}
 }

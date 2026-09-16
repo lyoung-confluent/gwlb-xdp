@@ -78,21 +78,31 @@ func ParseInterfaceName(name string) (gwlbID uint64, ok bool) {
 
 // withLockedOSThread runs fn pinned to its OS thread, restoring the thread's
 // original netns afterwards so a later goroutine can't inherit a leftover
-// netns change fn made. fn's own error takes priority over a restore error.
+// netns change fn made.
+//
+// The thread is only unlocked once its original netns is known to be restored:
+// if that restore fails, leaving the thread locked lets the Go runtime destroy
+// it when this goroutine exits, rather than returning a thread still in fn's
+// netns to the pool where a later goroutine would silently inherit it. A
+// restore failure is always reported (joined with fn's own error), never
+// swallowed — a thread stuck in the wrong netns is too dangerous to lose.
 func withLockedOSThread(fn func() error) error {
 	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
 
 	orig, err := netns.Get()
 	if err != nil {
+		// Never entered another netns, so the thread is safe to reuse.
+		runtime.UnlockOSThread()
 		return fmt.Errorf("netns.Get failed: %w", err)
 	}
 	defer orig.Close()
 
 	fnErr := fn()
-	if err := netns.Set(orig); err != nil && fnErr == nil {
-		return fmt.Errorf("netns.Set for %q failed: %w", orig, err)
+	if err := netns.Set(orig); err != nil {
+		// Thread deliberately left locked (not unlocked) — see the doc comment.
+		return errors.Join(fnErr, fmt.Errorf("netns.Set for %q failed (OS thread abandoned): %w", orig, err))
 	}
+	runtime.UnlockOSThread()
 	return fnErr
 }
 

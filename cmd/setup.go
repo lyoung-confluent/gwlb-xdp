@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -33,7 +34,7 @@ func init() {
 	SetupCmd.Flags().BoolVar(&Transparent, "transparent", Transparent, "hardcode every ENI on this box as a transparent appliance (reply comes back with the same 5-tuple, not swapped)")
 }
 
-func RunSetup(intfName string, maxENIs, maxFlows uint32, transparent bool) error {
+func RunSetup(intfName string, maxENIs, maxFlows uint32, transparent bool) (err error) {
 	intf, err := net.InterfaceByName(intfName)
 	if err != nil {
 		return fmt.Errorf("net.InterfaceByName for %q failed: %w", intfName, err)
@@ -59,6 +60,17 @@ func RunSetup(intfName string, maxENIs, maxFlows uint32, transparent bool) error
 	if _, err := decapProg.Attach(intf.Index, intfName); err != nil {
 		return fmt.Errorf("(*decap.Program).Attach for %q failed: %w", intfName, err)
 	}
+
+	// From here on decap is attached and its maps are pinned. If a later step
+	// fails, tear all of that back down so `setup` stays re-runnable rather
+	// than wedging on the leftover decap link/pins the next time around.
+	defer func() {
+		if err != nil {
+			if e := RunTeardown(); e != nil {
+				err = errors.Join(err, fmt.Errorf("rollback: RunTeardown failed: %w", e))
+			}
+		}
+	}()
 
 	encapProg, err := encap.Load(encap.Config{
 		Transparent: transparent,
