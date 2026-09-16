@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"github.com/gopacket/gopacket/layers"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
@@ -19,6 +20,33 @@ import (
 	"github.com/lyoung-confluent/gwlb-xdp/bpf/decap"
 	"github.com/lyoung-confluent/gwlb-xdp/cmd"
 )
+
+// flowStateCount returns the number of live entries in the pinned flow_state
+// map. Used only to assert `remove` sweeps an ENI's cached flows (see
+// TestRemove); walking the whole map is fine at test scale, and keeps that
+// scan out of production code now that the counters ship over statsd.
+func flowStateCount(t *testing.T) int {
+	t.Helper()
+	m, err := ebpf.LoadPinnedMap(bpf.PinDir+"/flow_state", nil)
+	if err != nil {
+		t.Fatalf("loading pinned flow_state map failed: %v", err)
+	}
+	defer m.Close()
+
+	var count int
+	var key interface{}
+	for {
+		next, err := m.NextKeyBytes(key)
+		if err != nil {
+			t.Fatalf("(*ebpf.Map).NextKeyBytes for flow_state failed: %v", err)
+		}
+		if next == nil {
+			return count
+		}
+		key = next
+		count++
+	}
+}
 
 // Two real veth pairs stand in for the two links gwlb-xdp actually drives:
 //
@@ -1004,9 +1032,7 @@ func TestRemove(t *testing.T) {
 	if reply := waitForReply(t, fd, uplinkIface.HardwareAddr, 5*time.Second); reply == nil {
 		t.Fatal("no reply before remove — round trip is broken, nothing to test removal against")
 	}
-	if v4, _, err := bpf.FlowStateEntries(); err != nil {
-		t.Fatalf("bpf.FlowStateEntries failed: %v", err)
-	} else if v4 == 0 {
+	if flowStateCount(t) == 0 {
 		t.Fatal("expected a flow_state entry before remove")
 	}
 	if got := metricSum(t, "decap_ok_packets", one.outerIfindex); got == 0 {
@@ -1040,10 +1066,8 @@ func TestRemove(t *testing.T) {
 	}
 
 	// flow_state swept — the whole point of remove's sweep (see decap.RemoveENI).
-	if v4, v6, err := bpf.FlowStateEntries(); err != nil {
-		t.Fatalf("bpf.FlowStateEntries failed: %v", err)
-	} else if v4 != 0 || v6 != 0 {
-		t.Errorf("flow_state not swept after remove: v4=%d v6=%d, want 0/0", v4, v6)
+	if n := flowStateCount(t); n != 0 {
+		t.Errorf("flow_state not swept after remove: %d entries, want 0", n)
 	}
 
 	// metrics rows for the freed ifindex swept, so a scrape stops emitting

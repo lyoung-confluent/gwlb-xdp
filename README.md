@@ -69,7 +69,7 @@ All maps live in [bpf/maps.h](bpf/maps.h) (`metrics` and `flow_state`) and [bpf/
 |---|---|
 | `eni_to_ifindex` | AWS ENI ID → veth-outer ifindex + synthesized L2 addressing. Sized by `--max-enis` at `setup`. |
 | `flow_state` | Inner 5-tuple (+ ifindex) → cached outer header bytes, one LRU hash shared by IPv4 and IPv6 flows alike (`struct flow_key`'s own family tag tells them apart) so old flows age out automatically. Sized by `--max-flows` for both families combined. Sharing one map trades away the hard per-family capacity isolation two separate maps gave — a burst of one family's flows can now evict the other's — for less space wasted on a v4 entry's unused address bytes. |
-| `metrics` | Per-(ifindex, counter) packet and byte counts, per-CPU, exposed by `gwlb-xdp metrics` ([cmd/metrics.go](cmd/metrics.go)) as Prometheus counters. |
+| `metrics` | Per-(ifindex, counter) packet and byte counts, per-CPU. With `--interval` set to a positive duration, `gwlb-xdp serve` ([cmd/serve.go](cmd/serve.go)) samples this map that often and pushes each counter's current value as a statsd gauge to a statsd endpoint (the local CloudWatch agent by default), tagged with `interface` and, for ENIs, `gwlb_id`. Pushing is off by default (`--interval 0`), leaving `serve` a health-only endpoint. |
 
 Two `.rodata` knobs set at `setup` fix behavior for the life of the loaded program rather than being looked up per packet: `eni_mode` (NAT/terminating vs. transparent-appliance reply orientation) and the uplink's own MAC/ifindex (so encap can address and redirect replies without a map lookup).
 
@@ -94,5 +94,5 @@ gwlb-xdp setup <uplink-ifname>            # load decap+encap, attach decap to th
 gwlb-xdp add <vpce-0000000aabbccddee>     # provision one ENI: netns + veth + attach encap
 gwlb-xdp remove <vpce-0000000aabbccddee>  # reverse add
 gwlb-xdp teardown                         # reverse setup (and any remaining add's)
-gwlb-xdp metrics                          # serve BPF packet counters as Prometheus metrics
+gwlb-xdp serve                            # serve the HTTP liveness endpoint (and optionally push counters to statsd)
 ```
