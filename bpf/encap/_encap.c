@@ -14,10 +14,6 @@
  */
 const volatile __u32 uplink_ifindex = 0;
 
-/* Per-address-family enable flags, mirroring _decap.c's. See maps.h. */
-const volatile __u8 ipv4_enabled = 1;
-const volatile __u8 ipv6_enabled = 1;
-
 /*
  * Reply orientation, set once by `setup` for the life of the program (see
  * setEniMode in cmd/setup.go): 0 (default) means every ENI on this box is
@@ -87,13 +83,6 @@ int encap(struct xdp_md *ctx)
 		is_v6 = true;
 	else
 		return XDP_PASS;
-
-	/* Family disabled at load time — drop before touching flow_state. */
-	if ((is_v6 && !ipv6_enabled) || (!is_v6 && !ipv4_enabled)) {
-		increment_metric(ifindex, ENCAP_CNT_DROP_FAMILY_DISABLED_PACKETS, 1);
-		increment_metric(ifindex, ENCAP_CNT_DROP_FAMILY_DISABLED_BYTES, frame_len);
-		return XDP_DROP;
-	}
 
 	__u16 sport = 0, dport = 0;
 	__u8 proto = 0;

@@ -13,8 +13,6 @@ import (
 
 var MaxENIs uint32 = 128
 var MaxFlows uint32 = 1048576
-var EnableIPv4 bool = true
-var EnableIPv6 bool = false
 var Transparent bool = false
 
 // ./gwlb-xdp setup
@@ -23,7 +21,7 @@ var SetupCmd = &cobra.Command{
 	Short: "Load and attach the XDP pipeline to the physical interface",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return RunSetup(args[0], MaxENIs, MaxFlows, EnableIPv4, EnableIPv6, Transparent)
+		return RunSetup(args[0], MaxENIs, MaxFlows, Transparent)
 	},
 }
 
@@ -32,12 +30,10 @@ func init() {
 
 	SetupCmd.Flags().Uint32Var(&MaxENIs, "max-enis", MaxENIs, "max concurrent ENIs this box can serve (sizes eni_to_ifindex)")
 	SetupCmd.Flags().Uint32Var(&MaxFlows, "max-flows", MaxFlows, "max concurrent flows tracked, IPv4 and IPv6 combined (sizes the shared flow_state map)")
-	SetupCmd.Flags().BoolVar(&EnableIPv4, "enable-ipv4", EnableIPv4, "accept IPv4 inner traffic")
-	SetupCmd.Flags().BoolVar(&EnableIPv6, "enable-ipv6", EnableIPv6, "accept IPv6 inner traffic")
 	SetupCmd.Flags().BoolVar(&Transparent, "transparent", Transparent, "hardcode every ENI on this box as a transparent appliance (reply comes back with the same 5-tuple, not swapped)")
 }
 
-func RunSetup(intfName string, maxENIs, maxFlows uint32, enableIPv4, enableIPv6, transparent bool) error {
+func RunSetup(intfName string, maxENIs, maxFlows uint32, transparent bool) error {
 	intf, err := net.InterfaceByName(intfName)
 	if err != nil {
 		return fmt.Errorf("net.InterfaceByName for %q failed: %w", intfName, err)
@@ -54,10 +50,8 @@ func RunSetup(intfName string, maxENIs, maxFlows uint32, enableIPv4, enableIPv6,
 	}
 
 	decapProg, err := decap.Load(decap.Config{
-		MaxENIs:    maxENIs,
-		MaxFlows:   maxFlows,
-		EnableIPv4: enableIPv4,
-		EnableIPv6: enableIPv6,
+		MaxENIs:  maxENIs,
+		MaxFlows: maxFlows,
 	})
 	if err != nil {
 		return fmt.Errorf("decap.Load failed: %w", err)
@@ -69,8 +63,6 @@ func RunSetup(intfName string, maxENIs, maxFlows uint32, enableIPv4, enableIPv6,
 	encapProg, err := encap.Load(encap.Config{
 		Transparent: transparent,
 		Uplink:      intf,
-		EnableIPv4:  enableIPv4,
-		EnableIPv6:  enableIPv6,
 	})
 	if err != nil {
 		return fmt.Errorf("encap.Load failed: %w", err)

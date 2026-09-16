@@ -13,21 +13,13 @@ import (
 )
 
 // Config configures encap before it's loaded. flow_state/metrics aren't
-// sized here — Load reads their sizes back from decap's pins (see Load) —
-// but EnableIPv4/V6 must still match what was passed to decap.Config: with
-// flow_state shared by both families (see bpf/maps.h), its size alone can no
-// longer tell encap which family, if either, decap disabled.
+// sized here — Load reads their sizes back from decap's pins (see Load).
 type Config struct {
 	// Transparent hardcodes every ENI on this box as a transparent
 	// appliance (reply comes back with the same 5-tuple, not swapped).
 	Transparent bool
 	// Uplink is the physical interface encap sends replies out of.
 	Uplink *net.Interface
-	// EnableIPv4/V6 must equal what was passed to decap.Config: false for
-	// either disables that family's own traffic here too, mirroring
-	// decap's ipv4_enabled/ipv6_enabled.
-	EnableIPv4 bool
-	EnableIPv6 bool
 }
 
 // Program is encap, loaded but not yet attached to any interface — pin
@@ -58,20 +50,6 @@ func Load(cfg Config) (*Program, error) {
 	}
 	if err := matchPinnedMapSize(spec, bpfMapMetrics); err != nil {
 		return nil, err
-	}
-
-	// ipv4_enabled/ipv6_enabled default to true in the compiled object
-	// (bpf/encap/_encap.c); only override here to disable one — per
-	// cfg.EnableIPv4/V6, not flow_state's size (see Config's doc comment).
-	if !cfg.EnableIPv4 {
-		if err := spec.Variables[bpfVarIpv4Enabled].Set(uint8(0)); err != nil {
-			return nil, fmt.Errorf("(*ebpf.VariableSpec).Set for ipv4_enabled failed: %w", err)
-		}
-	}
-	if !cfg.EnableIPv6 {
-		if err := spec.Variables[bpfVarIpv6Enabled].Set(uint8(0)); err != nil {
-			return nil, fmt.Errorf("(*ebpf.VariableSpec).Set for ipv6_enabled failed: %w", err)
-		}
 	}
 
 	// eni_mode defaults to 0 (NAT/terminating) in the compiled object

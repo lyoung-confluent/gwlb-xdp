@@ -59,8 +59,6 @@ const (
 	bpfMapFlowState    = "flow_state"
 	bpfMapMetrics      = "metrics"
 	bpfProgDecap       = "decap"
-	bpfVarIpv4Enabled  = "ipv4_enabled"
-	bpfVarIpv6Enabled  = "ipv6_enabled"
 )
 
 // loadBpf returns the embedded CollectionSpec for bpf.
@@ -121,8 +119,6 @@ type bpfMapSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfVariableSpecs struct {
-	Ipv4Enabled *ebpf.VariableSpec `ebpf:"ipv4_enabled"`
-	Ipv6Enabled *ebpf.VariableSpec `ebpf:"ipv6_enabled"`
 }
 
 // bpfObjects contains all objects after they have been loaded into the kernel.
@@ -162,8 +158,6 @@ func (m *bpfMaps) Close() error {
 //
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfVariables struct {
-	Ipv4Enabled *ebpf.Variable `ebpf:"ipv4_enabled"`
-	Ipv6Enabled *ebpf.Variable `ebpf:"ipv6_enabled"`
 }
 
 // bpfPrograms contains all programs after they have been loaded into the kernel.

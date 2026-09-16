@@ -52,8 +52,6 @@ const (
 	bpfMapMetrics       = "metrics"
 	bpfProgEncap        = "encap"
 	bpfVarEniMode       = "eni_mode"
-	bpfVarIpv4Enabled   = "ipv4_enabled"
-	bpfVarIpv6Enabled   = "ipv6_enabled"
 	bpfVarUplinkIfindex = "uplink_ifindex"
 )
 
@@ -115,8 +113,6 @@ type bpfMapSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfVariableSpecs struct {
 	EniMode       *ebpf.VariableSpec `ebpf:"eni_mode"`
-	Ipv4Enabled   *ebpf.VariableSpec `ebpf:"ipv4_enabled"`
-	Ipv6Enabled   *ebpf.VariableSpec `ebpf:"ipv6_enabled"`
 	UplinkIfindex *ebpf.VariableSpec `ebpf:"uplink_ifindex"`
 }
 
@@ -156,8 +152,6 @@ func (m *bpfMaps) Close() error {
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfVariables struct {
 	EniMode       *ebpf.Variable `ebpf:"eni_mode"`
-	Ipv4Enabled   *ebpf.Variable `ebpf:"ipv4_enabled"`
-	Ipv6Enabled   *ebpf.Variable `ebpf:"ipv6_enabled"`
 	UplinkIfindex *ebpf.Variable `ebpf:"uplink_ifindex"`
 }
 

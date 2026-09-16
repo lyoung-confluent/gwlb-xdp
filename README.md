@@ -68,7 +68,7 @@ All maps live in [bpf/maps.h](bpf/maps.h) (`metrics` and `flow_state`) and [bpf/
 | Map | Purpose |
 |---|---|
 | `eni_to_ifindex` | AWS ENI ID → veth-outer ifindex + synthesized L2 addressing. Sized by `--max-enis` at `setup`. |
-| `flow_state` | Inner 5-tuple (+ ifindex) → cached outer header bytes, one LRU hash shared by IPv4 and IPv6 flows alike (`struct flow_key`'s own family tag tells them apart) so old flows age out automatically. Sized by `--max-flows` for both families combined; `--enable-ipv4`/`--enable-ipv6` set a `.rodata` flag so both programs drop a disabled family's traffic before it ever touches the map. Sharing one map trades away the hard per-family capacity isolation two separate maps gave — a burst of one family's flows can now evict the other's — for less space wasted on a v4 entry's unused address bytes. |
+| `flow_state` | Inner 5-tuple (+ ifindex) → cached outer header bytes, one LRU hash shared by IPv4 and IPv6 flows alike (`struct flow_key`'s own family tag tells them apart) so old flows age out automatically. Sized by `--max-flows` for both families combined. Sharing one map trades away the hard per-family capacity isolation two separate maps gave — a burst of one family's flows can now evict the other's — for less space wasted on a v4 entry's unused address bytes. |
 | `metrics` | Per-(ifindex, counter) packet and byte counts, per-CPU, exposed by `gwlb-xdp metrics` ([cmd/metrics.go](cmd/metrics.go)) as Prometheus counters. |
 
 Two `.rodata` knobs set at `setup` fix behavior for the life of the loaded program rather than being looked up per packet: `eni_mode` (NAT/terminating vs. transparent-appliance reply orientation) and the uplink's own MAC/ifindex (so encap can address and redirect replies without a map lookup).

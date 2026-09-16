@@ -65,15 +65,6 @@ static __always_inline void *parse_gwlb_opt(__u8 **pos, void *data_end,
 	return data;
 }
 
-/* Per-address-family enable flags, set by the loader before load (default:
- * both enabled). A disabled family's inner packets are dropped before ever
- * touching flow_state (shared by both families — see maps.h — so there's
- * no per-family map to shrink the way there once was).
- * const volatile so the verifier treats them as constant once .rodata is
- * frozen, without constant-folding the pre-load default. */
-const volatile __u8 ipv4_enabled = 1;
-const volatile __u8 ipv6_enabled = 1;
-
 /* build_flow_key lives in geneve_defs.h, shared with encap. */
 
 SEC("xdp")
@@ -211,13 +202,6 @@ int decap(struct xdp_md *ctx)
 	else {
 		increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_PACKETS, 1);
 		increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
-		return XDP_DROP;
-	}
-
-	/* Family disabled at load time — drop before touching flow_state. */
-	if ((inner_is_v6 && !ipv6_enabled) || (!inner_is_v6 && !ipv4_enabled)) {
-		increment_metric(ifindex, DECAP_CNT_DROP_FAMILY_DISABLED_PACKETS, 1);
-		increment_metric(ifindex, DECAP_CNT_DROP_FAMILY_DISABLED_BYTES, frame_len);
 		return XDP_DROP;
 	}
 
