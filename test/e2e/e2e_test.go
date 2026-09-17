@@ -141,7 +141,7 @@ func setupUplink(t *testing.T) (uplinkIface, gwlbIface *net.Interface) {
 // would, and registers `teardown` to reverse it.
 func runSetup(t *testing.T, maxENIs uint32) {
 	t.Helper()
-	if err := cmd.RunSetup(uplinkIfName, maxENIs, 64, false); err != nil {
+	if err := cmd.RunSetup(uplinkIfName, maxENIs, 64, false, ""); err != nil {
 		t.Fatalf("cmd.RunSetup failed: %v", err)
 	}
 	t.Cleanup(func() {
@@ -695,6 +695,76 @@ func TestEndToEnd(t *testing.T) {
 		}
 		if got := metricSum(t, "decap_drop_malformed_bytes", uint32(uplinkIface.Index)); got != beforeBytes+uint64(len(badFrame)) {
 			t.Errorf("decap_drop_malformed_bytes[uplink ifindex] = %d, want %d", got, beforeBytes+uint64(len(badFrame)))
+		}
+	})
+}
+
+// TestOriginFiltering exercises --allowed-origin-cidr (decap.Config's
+// AllowedOriginCIDR, wired from cmd.RunSetup — see cmd/setup.go): a request
+// whose outer source IP falls inside the configured CIDR should be answered
+// exactly as if filtering were off, and one from outside it should be
+// dropped and counted, never reaching decap's ENI lookup — same pre-ENI,
+// uplink-ifindex-keyed shape as the other TestEndToEnd negative subtests.
+func TestOriginFiltering(t *testing.T) {
+	requireRoot(t)
+	_ = unix.Mount("bpf", "/sys/fs/bpf", "bpf", 0, "")
+
+	gwlbID := uint64(0xF17E5)
+
+	uplinkIface, gwlbIface := setupUplink(t)
+	// fakeGWLBOuterSrcIP (198.51.100.1) falls inside this /30.
+	if err := cmd.RunSetup(uplinkIfName, 8, 64, false, "198.51.100.0/30"); err != nil {
+		t.Fatalf("cmd.RunSetup failed: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cmd.RunTeardown(); err != nil {
+			t.Errorf("cmd.RunTeardown failed: %v", err)
+		}
+	})
+	one := provisionENI(t, gwlbID, true, echoServerPort, fakeClientMAC, func(b []byte) []byte { return b })
+	fd := openGWLBSocket(t, gwlbIface)
+
+	payload := []byte("hello from the origin filtering test")
+
+	t.Run("allowed origin is answered", func(t *testing.T) {
+		reqFrame, reqOpts := sendGENEVE(t, fd, uplinkIface, gwlbIface, gwlbID, payload)
+		reply := waitForReply(t, fd, uplinkIface.HardwareAddr, 5*time.Second)
+		if reply == nil {
+			t.Fatal("no GENEVE reply observed for an allowed origin within 5s")
+		}
+		assertValidReply(t, reply, gwlbIface, reqOpts, payload)
+		assertOKMetrics(t, one.outerIfindex, len(reqFrame), len(payload))
+	})
+
+	t.Run("disallowed origin is dropped", func(t *testing.T) {
+		badFrame, err := buildRequestFrame(requestParams{
+			outerSrcMAC:  gwlbIface.HardwareAddr,
+			outerDstMAC:  uplinkIface.HardwareAddr,
+			outerSrcIP:   net.ParseIP("203.0.113.1"), // outside 198.51.100.0/30
+			outerDstIP:   net.ParseIP(fakeGWLBOuterDstIP),
+			outerSrcPort: fakeOuterSrcPort,
+			vni:          [3]byte{0, 0, 0},
+			opts:         buildGeneveOptions(gwlbID, fakeAttachmentID, fakeFlowCookie),
+			innerSrcIP:   net.ParseIP(fakeClientIP),
+			innerDstIP:   net.ParseIP(echoServerIP),
+			innerSrcPort: fakeClientPort,
+			innerDstPort: echoServerPort,
+			payload:      payload,
+		})
+		if err != nil {
+			t.Fatalf("buildRequestFrame failed: %v", err)
+		}
+		if err := unix.Sendto(fd, badFrame, 0, &unix.SockaddrLinklayer{Ifindex: gwlbIface.Index}); err != nil {
+			t.Fatalf("unix.Sendto failed: %v", err)
+		}
+		if reply := waitForReply(t, fd, uplinkIface.HardwareAddr, 2*time.Second); reply != nil {
+			t.Fatalf("got a GENEVE reply for a disallowed origin, want none: %+v", reply)
+		}
+		if got := metricSum(t, "decap_drop_origin_not_allowed_packets", uint32(uplinkIface.Index)); got != 1 {
+			t.Errorf("decap_drop_origin_not_allowed_packets[uplink ifindex] = %d, want 1", got)
+		}
+		if got := metricSum(t, "decap_drop_origin_not_allowed_bytes", uint32(uplinkIface.Index)); got != uint64(len(badFrame)) {
+			t.Errorf("decap_drop_origin_not_allowed_bytes[uplink ifindex] = %d, want %d", got, len(badFrame))
 		}
 	})
 }

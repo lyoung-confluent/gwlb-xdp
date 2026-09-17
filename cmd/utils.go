@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"runtime"
 	"strconv"
@@ -12,6 +13,22 @@ import (
 	"github.com/mr-tron/base58"
 	"github.com/vishvananda/netns"
 )
+
+// ParseIPv4CIDR parses cidr (as passed via --allowed-origin-cidr) into its
+// canonical network prefix (host bits zeroed), rejecting anything that isn't
+// an IPv4 prefix — GWLB's outer GENEVE tunnel is always IPv4 (see
+// geneve_defs.h), so an IPv6 CIDR could never match and almost certainly
+// indicates a mistake.
+func ParseIPv4CIDR(cidr string) (netip.Prefix, error) {
+	p, err := netip.ParsePrefix(cidr)
+	if err != nil {
+		return netip.Prefix{}, fmt.Errorf("%q isn't a valid CIDR: %w", cidr, err)
+	}
+	if !p.Addr().Is4() {
+		return netip.Prefix{}, fmt.Errorf("%q isn't an IPv4 CIDR (GWLB's outer GENEVE origin is always IPv4)", cidr)
+	}
+	return p.Masked(), nil
+}
 
 func ParseVPCEID(vpceID string) (gwlbID uint64, err error) {
 	hex, ok := strings.CutPrefix(vpceID, "vpce-")

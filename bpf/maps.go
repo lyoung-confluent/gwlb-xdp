@@ -51,6 +51,8 @@ var CounterNames = []string{
 	"encap_drop_flow_miss_bytes",
 	"encap_ok_packets",
 	"encap_ok_bytes",
+	"decap_drop_origin_not_allowed_packets",
+	"decap_drop_origin_not_allowed_bytes",
 }
 
 // Metric is one interface's row for a counter: Ifindex identifies the

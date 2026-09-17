@@ -63,15 +63,16 @@ Namespacing each VPC endpoint this way means the appliance/backend logic behind 
 
 ### Shared BPF state
 
-All maps live in [bpf/maps.h](bpf/maps.h) (`metrics` and `flow_state`) and [bpf/decap/_decap.c](bpf/decap/_decap.c) (`eni_to_ifindex`), pinned by name so both programs' loads resolve to the same underlying map:
+All maps live in [bpf/maps.h](bpf/maps.h) (`metrics` and `flow_state`) and [bpf/decap/_decap.c](bpf/decap/_decap.c) (`eni_to_ifindex`, `allowed_origins`), pinned by name so both programs' loads resolve to the same underlying map:
 
 | Map | Purpose |
 |---|---|
 | `eni_to_ifindex` | AWS ENI ID → veth-outer ifindex + synthesized L2 addressing. Sized by `--max-enis` at `setup`. |
 | `flow_state` | Inner 5-tuple (+ ifindex) → cached outer header bytes, one LRU hash shared by IPv4 and IPv6 flows alike (`struct flow_key`'s own family tag tells them apart) so old flows age out automatically. Sized by `--max-flows` for both families combined. Sharing one map trades away the hard per-family capacity isolation two separate maps gave — a burst of one family's flows can now evict the other's — for less space wasted on a v4 entry's unused address bytes. |
 | `metrics` | Per-(ifindex, counter) packet and byte counts, per-CPU. With `--interval` set to a positive duration, `gwlb-xdp serve` ([cmd/serve.go](cmd/serve.go)) samples this map that often and pushes each counter's current value as a statsd gauge to a statsd endpoint (the local CloudWatch agent by default), tagged with `interface` and, for ENIs, `gwlb_id`. Pushing is off by default (`--interval 0`), leaving `serve` a health-only endpoint. |
+| `allowed_origins` | GENEVE outer source IPv4 CIDRs decap will accept, an LPM trie populated from `--allowed-origin-cidr` (repeatable) at `setup`. A GENEVE packet whose outer source doesn't match any entry is dropped and counted in `decap_drop_origin_not_allowed_{packets,bytes}`. Empty (the default, when the flag is never passed) means every origin is accepted — see `origin_filter_enabled` below. |
 
-Two `.rodata` knobs set at `setup` fix behavior for the life of the loaded program rather than being looked up per packet: `eni_mode` (NAT/terminating vs. transparent-appliance reply orientation) and the uplink's own MAC/ifindex (so encap can address and redirect replies without a map lookup).
+Two `.rodata` knobs set at `setup` fix behavior for the life of the loaded program rather than being looked up per packet: `eni_mode` (NAT/terminating vs. transparent-appliance reply orientation) and the uplink's own MAC/ifindex (so encap can address and redirect replies without a map lookup). A third, `origin_filter_enabled`, gates the `allowed_origins` lookup above — 0 (default) skips it entirely, rather than treating an empty map as "reject everything".
 
 ### Build & deploy
 

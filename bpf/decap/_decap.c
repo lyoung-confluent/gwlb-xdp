@@ -5,6 +5,21 @@
 #include "maps.h"
 
 /*
+ * Restricts accepted GENEVE traffic to one outer-source IPv4 CIDR, set once
+ * by `setup` from --allowed-origin-cidr (see decap.Load in decap.go). Both
+ * default to all-zero bytes, under which (ip->saddr & mask) == addr holds
+ * for every packet (0 == 0 always) — filtering is off unless the flag is
+ * passed, with no separate enable/disable knob needed.
+ *
+ * Stored as raw address bytes (network order, the same order ip->saddr
+ * holds in memory) rather than a __u32, so setup.go never has to reason
+ * about host-vs-network byte order when populating them — see
+ * AllowedOriginCIDR in decap.go.
+ */
+const volatile __u8 allowed_origin_addr[4] = {0, 0, 0, 0};
+const volatile __u8 allowed_origin_mask[4] = {0, 0, 0, 0};
+
+/*
  * Value type for eni_to_ifindex: the veth-outer ifindex plus the L2 addressing
  * decap synthesizes into the Ethernet header (GWLB encapsulates at L3, so
  * there's no inner L2 header to preserve). All three are decap-only and looked
@@ -104,6 +119,34 @@ int decap(struct xdp_md *ctx)
 		increment_metric(ingress_ifindex, DECAP_CNT_PASS_NOT_GENEVE_PACKETS, 1);
 		increment_metric(ingress_ifindex, DECAP_CNT_PASS_NOT_GENEVE_BYTES, frame_len);
 		return XDP_PASS;
+	}
+
+	{
+		/* Read element-by-element rather than memcpy'ing straight off
+		 * allowed_origin_addr/_mask: memcpy's source argument is a plain
+		 * (non-volatile) pointer, so passing the volatile array itself
+		 * would strip its volatile qualifier and let the compiler serve
+		 * the *compiled-in* initializer instead of a genuine load of
+		 * whatever `setup` actually wrote there — silently ignoring
+		 * --allowed-origin-cidr. Indexing each element is a properly
+		 * volatile-qualified access, forcing the real read. */
+		__u8 addr_bytes[4] = {
+			allowed_origin_addr[0], allowed_origin_addr[1],
+			allowed_origin_addr[2], allowed_origin_addr[3],
+		};
+		__u8 mask_bytes[4] = {
+			allowed_origin_mask[0], allowed_origin_mask[1],
+			allowed_origin_mask[2], allowed_origin_mask[3],
+		};
+		__u32 addr, mask;
+
+		__builtin_memcpy(&addr, addr_bytes, sizeof(addr));
+		__builtin_memcpy(&mask, mask_bytes, sizeof(mask));
+		if ((ip->saddr & mask) != addr) {
+			increment_metric(ingress_ifindex, DECAP_CNT_DROP_ORIGIN_NOT_ALLOWED_PACKETS, 1);
+			increment_metric(ingress_ifindex, DECAP_CNT_DROP_ORIGIN_NOT_ALLOWED_BYTES, frame_len);
+			return XDP_DROP;
+		}
 	}
 
 	struct gwlb_genevehdr *gnv = (void *)(udp + 1);

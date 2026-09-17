@@ -3,9 +3,11 @@ package decap
 //go:generate go tool bpf2go -target amd64,arm64 -cflags "-g -O2 -I.. -Wall -Wno-unused-value -Wno-pointer-sign -Wno-compare-distinct-pointer-types" bpf _decap.c
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -27,6 +29,11 @@ type Config struct {
 	// MaxFlows sizes the one shared flow_state map — IPv4 and IPv6 flows
 	// together, not each.
 	MaxFlows uint32
+	// AllowedOriginCIDR, if valid (see netip.Prefix.IsValid), restricts
+	// accepted GENEVE traffic to packets whose outer (GWLB) source IP falls
+	// in this one IPv4 CIDR — anything else is dropped. The zero Prefix
+	// (the default) accepts every origin, matching pre-existing behavior.
+	AllowedOriginCIDR netip.Prefix
 }
 
 // Program is decap, loaded and pinned under /sys/fs/bpf/gwlb-xdp.
@@ -48,6 +55,26 @@ func Load(cfg Config) (*Program, error) {
 	spec.Maps[bpfMapEniToIfindex].MaxEntries = cfg.MaxENIs
 	spec.Maps[bpfMapFlowState].MaxEntries = max(cfg.MaxFlows, 1)
 	spec.Maps[bpfMapMetrics].MaxEntries *= (cfg.MaxENIs + 1)
+
+	// allowed_origin_addr/_mask default to all-zero bytes in the compiled
+	// object, under which every packet passes (see _decap.c); only override
+	// them here to actually turn filtering on.
+	if cfg.AllowedOriginCIDR.IsValid() {
+		bits := cfg.AllowedOriginCIDR.Bits()
+		var maskBits uint32
+		if bits > 0 {
+			maskBits = ^uint32(0) << (32 - bits)
+		}
+		var mask [4]byte
+		binary.BigEndian.PutUint32(mask[:], maskBits)
+
+		if err := spec.Variables[bpfVarAllowedOriginAddr].Set(cfg.AllowedOriginCIDR.Addr().As4()); err != nil {
+			return nil, fmt.Errorf("(*ebpf.VariableSpec).Set for allowed_origin_addr failed: %w", err)
+		}
+		if err := spec.Variables[bpfVarAllowedOriginMask].Set(mask); err != nil {
+			return nil, fmt.Errorf("(*ebpf.VariableSpec).Set for allowed_origin_mask failed: %w", err)
+		}
+	}
 
 	var objs bpfObjects
 	if err := spec.LoadAndAssign(&objs, &ebpf.CollectionOptions{
