@@ -15,6 +15,35 @@ import (
 // PinDir is the bpffs directory holding every map and link the loader pins.
 const PinDir = "/sys/fs/bpf/gwlb-xdp"
 
+// GWLBMTU is GWLB's documented MTU: the largest inner packet (IP header
+// onward) it's guaranteed to carry. It's what an ENI's netns should size its
+// own replies to, with a route MTU (see README.md) — GWLB sends no ICMP
+// "fragmentation needed", so a DF-set reply it won't carry is silently lost.
+// It is not a limit on what GWLB delivers: see MaxInnerLen.
+const GWLBMTU = 8500
+
+// GeneveOverhead is what encapsulation adds to an inner packet on the wire:
+// outer IPv4(20) + UDP(8) + GENEVE(8) + GWLB's three options(32). Must match
+// GENEVE_OVERHEAD in geneve_defs.h.
+const GeneveOverhead = 68
+
+// minInnerLen is the smallest MaxInnerLen allowed: Linux's minimum Ethernet
+// MTU, below which an ENI's veth can't be created.
+const minInnerLen = 68
+
+// MaxInnerLen returns the largest inner packet (IP header onward) one GENEVE
+// packet on an uplink with this MTU can carry. It's decap's and encap's
+// max_inner_len and each ENI veth's MTU: GWLB doesn't hold what it delivers
+// to GWLBMTU (including fragments it creates itself), so the receive side
+// has to accept anything the uplink can carry.
+func MaxInnerLen(uplinkMTU int) (int, error) {
+	n := uplinkMTU - GeneveOverhead
+	if n < minInnerLen {
+		return 0, fmt.Errorf("uplink MTU %d leaves no room for the %d-byte GENEVE encapsulation", uplinkMTU, GeneveOverhead)
+	}
+	return n, nil
+}
+
 // CreatePinDir creates the bpffs pin directory. Called by decap.Load and
 // encap.Load before pinning anything under it.
 func CreatePinDir() error {
@@ -53,6 +82,10 @@ var CounterNames = []string{
 	"encap_ok_bytes",
 	"decap_drop_origin_not_allowed_packets",
 	"decap_drop_origin_not_allowed_bytes",
+	"decap_drop_oversize_packets",
+	"decap_drop_oversize_bytes",
+	"encap_drop_oversize_packets",
+	"encap_drop_oversize_bytes",
 }
 
 // Metric is one interface's row for a counter: Ifindex identifies the
@@ -103,6 +136,12 @@ func FlowStateRemove(ifindex uint32) error {
 	return sweepByIfindex("flow_state", ifindex)
 }
 
+// FragStateRemove deletes every entry in the pinned frag_state map (encap's
+// in-flight reply fragment tracking) belonging to ifindex.
+func FragStateRemove(ifindex uint32) error {
+	return sweepByIfindex("frag_state", ifindex)
+}
+
 // MetricsRemove deletes every entry in the pinned metrics map belonging to
 // ifindex — one removed ENI's counter rows, so a scrape stops emitting series
 // for an interface that no longer exists.
@@ -112,7 +151,8 @@ func MetricsRemove(ifindex uint32) error {
 
 // sweepByIfindex deletes every entry in the pinned map named mapName whose key
 // begins with ifindex — its first 4 bytes in native byte order, the leading
-// field of both struct flow_key and struct metric_key. Keys are collected
+// field of both struct flow_key (flow_state and frag_state's key) and struct
+// metric_key. Keys are collected
 // first, then deleted, to avoid mutating the map mid-iteration.
 //
 // A missing pin is tolerated (returns nil): it just means nothing has been

@@ -14,11 +14,12 @@ loader: docker-build
 # End-to-end test (test/e2e): synthesizes a GWLB GENEVE packet and pushes it
 # through real decap/encap XDP programs, veths, netns and a UDP echo server —
 # no real GWLB involved. Needs real netns/veth/XDP support (CAP_NET_ADMIN,
-# CAP_SYS_ADMIN, CAP_BPF), hence --privileged, same as `verify` below.
+# CAP_SYS_ADMIN, CAP_BPF), hence --privileged, same as `verify` below. Runs
+# the plain unit tests (./cmd, ...) alongside it.
 e2e: docker-build
 	docker run --rm --privileged --platform=$(PLATFORM) -v $(CURDIR):/work $(IMAGE) sh -euc '\
 		mount -t bpf bpf /sys/fs/bpf 2>/dev/null || true; \
-		go test -tags e2e -count=1 -v ./test/e2e/...'
+		go test -tags e2e -count=1 -v ./...'
 
 verify: docker-build
 	docker run --rm --privileged --platform=$(PLATFORM) -v $(CURDIR):/work $(IMAGE) sh -euc '\

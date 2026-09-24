@@ -36,6 +36,8 @@ func RunRemove(vpceID string) error {
 	if err != nil {
 		return fmt.Errorf("ParseVPCEID for %q failed: %w", vpceID, err)
 	}
+	// The netns was named after the canonical spelling (see RunAdd).
+	vpceID = FormatVPCEID(gwlbID)
 
 	// A non-zero Ifindex means the entry was deleted even if the error is set
 	// (see RemoveENI), so that — not the error — gates detaching encap and

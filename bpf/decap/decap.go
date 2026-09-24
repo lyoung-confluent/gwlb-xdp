@@ -29,6 +29,10 @@ type Config struct {
 	// MaxFlows sizes the one shared flow_state map — IPv4 and IPv6 flows
 	// together, not each.
 	MaxFlows uint32
+	// MaxInnerLen is the largest inner packet decap delivers (see
+	// bpf.MaxInnerLen); anything larger is dropped as oversize. Zero keeps
+	// the compiled-in default.
+	MaxInnerLen uint32
 	// AllowedOriginCIDR, if valid (see netip.Prefix.IsValid), restricts
 	// accepted GENEVE traffic to packets whose outer (GWLB) source IP falls
 	// in this one IPv4 CIDR — anything else is dropped. The zero Prefix
@@ -55,6 +59,12 @@ func Load(cfg Config) (*Program, error) {
 	spec.Maps[bpfMapEniToIfindex].MaxEntries = cfg.MaxENIs
 	spec.Maps[bpfMapFlowState].MaxEntries = max(cfg.MaxFlows, 1)
 	spec.Maps[bpfMapMetrics].MaxEntries *= (cfg.MaxENIs + 1)
+
+	if cfg.MaxInnerLen != 0 {
+		if err := spec.Variables[bpfVarMaxInnerLen].Set(cfg.MaxInnerLen); err != nil {
+			return nil, fmt.Errorf("(*ebpf.VariableSpec).Set for max_inner_len failed: %w", err)
+		}
+	}
 
 	// allowed_origin_addr/_mask default to all-zero bytes in the compiled
 	// object, under which every packet passes (see _decap.c); only override
@@ -109,6 +119,26 @@ func Attached() bool {
 	return true
 }
 
+// UplinkIfindex returns the ifindex of the interface decap's pinned link is
+// attached to — the uplink `setup` was run against.
+func UplinkIfindex() (int, error) {
+	l, err := link.LoadPinnedLink(PinLink, nil)
+	if err != nil {
+		return 0, fmt.Errorf("link.LoadPinnedLink for %q failed: %w", PinLink, err)
+	}
+	defer l.Close()
+
+	info, err := l.Info()
+	if err != nil {
+		return 0, fmt.Errorf("(link.Link).Info for %q failed: %w", PinLink, err)
+	}
+	xdp := info.XDP()
+	if xdp == nil {
+		return 0, fmt.Errorf("%q isn't an XDP link", PinLink)
+	}
+	return int(xdp.Ifindex), nil
+}
+
 // ProvisionedENIs returns the ENI IDs currently in eni_to_ifindex, or nil if
 // the map isn't pinned or can't be read.
 func ProvisionedENIs() ([]uint64, error) {
@@ -153,7 +183,7 @@ func AddENI(gwlbID uint64, ifindex uint32, dstMac, srcMac net.HardwareAddr) erro
 }
 
 // RemoveENI deletes gwlbID's entry from eni_to_ifindex and sweeps its
-// flow_state cache entries and metrics rows by ifindex (a recycled veth
+// flow_state/frag_state cache entries and metrics rows by ifindex (a recycled veth
 // ifindex could otherwise match stale flow entries before the LRU ages them
 // out, and stale metrics would keep being scraped). It returns the entry as it
 // stood before deletion, so the caller can detach anything keyed on its
@@ -180,6 +210,7 @@ func RemoveENI(gwlbID uint64) (EniInfo, error) {
 
 	sweepErr := errors.Join(
 		bpf.FlowStateRemove(info.Ifindex),
+		bpf.FragStateRemove(info.Ifindex),
 		bpf.MetricsRemove(info.Ifindex),
 	)
 	return info, sweepErr

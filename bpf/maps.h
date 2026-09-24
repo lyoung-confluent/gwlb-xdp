@@ -40,6 +40,15 @@ enum metric {
 	ENCAP_CNT_OK_BYTES,
 	DECAP_CNT_DROP_ORIGIN_NOT_ALLOWED_PACKETS,
 	DECAP_CNT_DROP_ORIGIN_NOT_ALLOWED_BYTES,
+	/* Inner packet larger than one GENEVE packet on the uplink can carry
+	 * (max_inner_len in _decap.c) — most likely GRO-merged GENEVE
+	 * packets. */
+	DECAP_CNT_DROP_OVERSIZE_PACKETS,
+	DECAP_CNT_DROP_OVERSIZE_BYTES,
+	/* Reply too large to fit the uplink once encapsulated — see
+	 * max_inner_len in _encap.c. */
+	ENCAP_CNT_DROP_OVERSIZE_PACKETS,
+	ENCAP_CNT_DROP_OVERSIZE_BYTES,
 	__METRIC_MAX,
 };
 
@@ -58,7 +67,9 @@ struct {
 } metrics SEC(".maps");
 
 /* amount is 1 for every packet-outcome counter, or a packet's byte length
- * for a _BYTES counter. */
+ * for a _BYTES counter. A plain (non-atomic) add is enough: the value is
+ * this CPU's own copy, and both programs run in softirq context (NAPI, or
+ * the backlog queue veth feeds), which never nests on one CPU. */
 static __always_inline void increment_metric(__u32 ifindex, __u32 idx, __u64 amount)
 {
 	struct metric_key key = { .ifindex = ifindex, .counter = idx };
@@ -74,7 +85,7 @@ static __always_inline void increment_metric(__u32 ifindex, __u32 idx, __u64 amo
 		cnt = bpf_map_lookup_elem(&metrics, &key);
 	}
 	if (cnt)
-		__sync_fetch_and_add(cnt, amount);
+		*cnt += amount;
 }
 
 #endif /* GWLB_XDP_MAPS_H */

@@ -7,8 +7,10 @@ import (
 	"net/netip"
 	"os"
 
+	"github.com/safchain/ethtool"
 	"github.com/spf13/cobra"
 
+	"github.com/lyoung-confluent/gwlb-xdp/bpf"
 	"github.com/lyoung-confluent/gwlb-xdp/bpf/decap"
 	"github.com/lyoung-confluent/gwlb-xdp/bpf/encap"
 )
@@ -51,19 +53,36 @@ func RunSetup(intfName string, maxENIs, maxFlows uint32, transparent bool, allow
 		}
 	}
 
-	// AWS recommends an MTU of at least 8564 for GWLB's full 8500-byte
-	// packets. Warn only — plenty of deployments never see packets that large.
-	if intf.MTU < 8564 {
-		fmt.Fprintf(os.Stderr,
-			"gwlb-xdp: warning: %s's MTU is %d, below the 8564 AWS recommends "+
-				"for GWLB's full 8500-byte packet support — large packets may be "+
-				"dropped. Raise %s's MTU (e.g. to 9001) if you need to support them.\n",
-			intfName, intf.MTU, intfName)
+	// decap, encap and every ENI veth are sized from the uplink's MTU (see
+	// bpf.MaxInnerLen), so a nonsensical one fails here, before anything is
+	// loaded.
+	maxInnerLen, err := bpf.MaxInnerLen(intf.MTU)
+	if err != nil {
+		return fmt.Errorf("bpf.MaxInnerLen for %q failed: %w", intfName, err)
 	}
+
+	// GWLB's documented 8500-byte inner packets need 8568 bytes on the
+	// uplink once GENEVE's 68 are added. Warn only — plenty of deployments
+	// never see packets that large.
+	if minMTU := bpf.GWLBMTU + bpf.GeneveOverhead; intf.MTU < minMTU {
+		fmt.Fprintf(os.Stderr,
+			"gwlb-xdp: warning: %s's MTU is %d, below the %d GWLB's %d-byte "+
+				"packets need once encapsulated — large packets will be dropped. "+
+				"Raise %s's MTU (e.g. to 9001) if you need to support them.\n",
+			intfName, intf.MTU, minMTU, bpf.GWLBMTU, intfName)
+	}
+
+	// decap usually runs as generic XDP (at a jumbo MTU, most NICs, ENA
+	// included, refuse native XDP), which runs after GRO. With UDP GRO
+	// forwarding enabled on the uplink, GENEVE packets can reach decap
+	// merged into one oversized packet, which it can only drop. Warn rather
+	// than change the uplink's own settings.
+	warnUplinkUDPGRO(intfName)
 
 	decapProg, err := decap.Load(decap.Config{
 		MaxENIs:           maxENIs,
 		MaxFlows:          maxFlows,
+		MaxInnerLen:       uint32(maxInnerLen),
 		AllowedOriginCIDR: originCIDR,
 	})
 	if err != nil {
@@ -97,4 +116,30 @@ func RunSetup(intfName string, maxENIs, maxFlows uint32, transparent bool, allow
 		return fmt.Errorf("(*encap.Program).Pin failed: %w", err)
 	}
 	return nil
+}
+
+// warnUplinkUDPGRO warns if any feature that lets GRO merge plain UDP
+// datagrams (and so GENEVE packets, with no GENEVE tunnel device to
+// terminate them) is enabled on ifname. Best-effort: failing to read the
+// features just skips the warning.
+func warnUplinkUDPGRO(ifname string) {
+	et, err := ethtool.NewEthtool()
+	if err != nil {
+		return
+	}
+	defer et.Close()
+
+	features, err := et.Features(ifname)
+	if err != nil {
+		return
+	}
+	for _, name := range [...]string{"rx-udp-gro-forwarding", "rx-gro-list"} {
+		if features[name] {
+			fmt.Fprintf(os.Stderr,
+				"gwlb-xdp: warning: %s has %s enabled, which can merge GENEVE packets "+
+					"into one before decap sees them — decap drops those as oversize "+
+					"(decap_drop_oversize_*). Disable it (ethtool -K %s %s off).\n",
+				ifname, name, ifname, name)
+		}
+	}
 }

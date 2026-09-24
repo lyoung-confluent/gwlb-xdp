@@ -20,6 +20,17 @@ const volatile __u8 allowed_origin_addr[4] = {0, 0, 0, 0};
 const volatile __u8 allowed_origin_mask[4] = {0, 0, 0, 0};
 
 /*
+ * The largest inner packet (IP header onward) decap will deliver, set once
+ * by `setup` to the uplink's MTU - GENEVE_OVERHEAD (see decap.Load) — the
+ * most a single GENEVE packet on the uplink can carry, and each ENI veth's
+ * MTU (see `add`). Deliberately not GWLB's documented 8500: GWLB doesn't
+ * hold the packets it sends to that, including the fragments it creates
+ * itself when splitting a larger packet, so anything the uplink can carry
+ * has to be deliverable.
+ */
+const volatile __u32 max_inner_len = DEFAULT_MAX_INNER_LEN;
+
+/*
  * Value type for eni_to_ifindex: the veth-outer ifindex plus the L2 addressing
  * decap synthesizes into the Ethernet header (GWLB encapsulates at L3, so
  * there's no inner L2 header to preserve). All three are decap-only and looked
@@ -80,7 +91,8 @@ static __always_inline void *parse_gwlb_opt(__u8 **pos, void *data_end,
 	return data;
 }
 
-/* build_flow_key lives in geneve_defs.h, shared with encap. */
+/* parse_ipv4/parse_ipv6 and build_flow_key live in geneve_defs.h, shared
+ * with encap. */
 
 SEC("xdp")
 int decap(struct xdp_md *ctx)
@@ -231,6 +243,16 @@ int decap(struct xdp_md *ctx)
 	}
 	__u32 ifindex = info->ifindex;
 
+	/* Larger than any single GENEVE packet the uplink can carry: most
+	 * likely several GRO merged into one before this program ran (generic
+	 * XDP runs after GRO). Redirecting it would fail silently against the
+	 * veth's MTU anyway, so drop it here where it can be counted. */
+	if (frame_len - OUTER_HDR_LEN > max_inner_len) {
+		increment_metric(ifindex, DECAP_CNT_DROP_OVERSIZE_PACKETS, 1);
+		increment_metric(ifindex, DECAP_CNT_DROP_OVERSIZE_BYTES, frame_len);
+		return XDP_DROP;
+	}
+
 	/* GWLB encapsulates at L3: proto_type is the inner packet's ethertype
 	 * and there is no inner Ethernet header. Only IPv4/IPv6 inner packets
 	 * are supported. */
@@ -248,71 +270,25 @@ int decap(struct xdp_md *ctx)
 		return XDP_DROP;
 	}
 
-	__u16 inner_sport = 0, inner_dport = 0;
-	union flow_addr saddr, daddr;
-	__u8 inner_proto = 0;
-
-	__builtin_memset(&saddr, 0, sizeof(saddr));
-	__builtin_memset(&daddr, 0, sizeof(daddr));
-
-	if (!inner_is_v6) {
-		struct iphdr *inner_ip = (void *)opt_end;
-
-		if ((void *)(inner_ip + 1) > data_end) {
-			increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_PACKETS, 1);
-			increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
-			return XDP_DROP;
-		}
-		if (inner_ip->ihl < 5) {
-			increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_PACKETS, 1);
-			increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
-			return XDP_DROP;
-		}
-
-		if (inner_ip->protocol == IPPROTO_TCP || inner_ip->protocol == IPPROTO_UDP ||
-		    inner_ip->protocol == IPPROTO_ICMP) {
-			/* sport/dport (TCP/UDP) or id (ICMP) are all within the
-			 * first 8 bytes, so a udphdr-shaped bounds check covers
-			 * either — see parse_l4_ports. */
-			__u8 *l4 = (__u8 *)inner_ip + (inner_ip->ihl * 4);
-			struct udphdr *l4hdr = (void *)l4;
-
-			if ((void *)(l4hdr + 1) > data_end) {
-				increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_PACKETS, 1);
-				increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
-				return XDP_DROP;
-			}
-			parse_l4_ports(inner_ip->protocol, l4, &inner_sport, &inner_dport);
-		}
-		/* Other protocols: ports left 0, flow keyed on addrs+proto. */
-		saddr.v4 = inner_ip->saddr;
-		daddr.v4 = inner_ip->daddr;
-		inner_proto = inner_ip->protocol;
-	} else {
-		struct ipv6hdr *inner_ip6 = (void *)opt_end;
-
-		if ((void *)(inner_ip6 + 1) > data_end) {
-			increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_PACKETS, 1);
-			increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
-			return XDP_DROP;
-		}
-		/* Extension headers aren't walked: for GWLB traffic L4 sits
-		 * immediately after the 40-byte base header. */
-		if (inner_ip6->nexthdr == IPPROTO_TCP || inner_ip6->nexthdr == IPPROTO_UDP ||
-		    inner_ip6->nexthdr == IPPROTO_ICMPV6) {
-			struct udphdr *l4hdr = (void *)(inner_ip6 + 1);
-
-			if ((void *)(l4hdr + 1) > data_end) {
-				increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_PACKETS, 1);
-				increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
-				return XDP_DROP;
-			}
-			parse_l4_ports(inner_ip6->nexthdr, l4hdr, &inner_sport, &inner_dport);
-		}
-		__builtin_memcpy(saddr.v6, &inner_ip6->saddr, 16);
-		__builtin_memcpy(daddr.v6, &inner_ip6->daddr, 16);
-		inner_proto = inner_ip6->nexthdr;
+	struct inner_tuple t;
+	void *l4;
+	int err = inner_is_v6 ? parse_ipv6((void *)opt_end, data_end, &t, &l4)
+			      : parse_ipv4((void *)opt_end, data_end, &t, &l4);
+	if (err) {
+		increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_PACKETS, 1);
+		increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
+		return XDP_DROP;
 	}
+
+	/* Every well-formed inner packet is delivered, but not every one
+	 * gets a flow_state entry:
+	 *  - a non-first fragment carries no L4 header, so its ports (and so
+	 *    its flow_key) are unknowable — the first fragment caches the
+	 *    flow for all of them;
+	 *  - an ICMP error never elicits a reply, and has no port-like id of
+	 *    its own to key on — caching it would only collapse every such
+	 *    error between two hosts onto one entry for nothing. */
+	bool cache_flow = t.frag != FRAG_LATER && !icmp_is_quoting_error(inner_is_v6, &t);
 
 	/* Cache under a single key: the tuple exactly as forwarded to the
 	 * appliance. The reply can come back in either orientation, but
@@ -320,8 +296,8 @@ int decap(struct xdp_md *ctx)
 	 * fixes this box's orientation at load time, so it looks up exactly
 	 * one. */
 	struct flow_key fwd_key;
-	build_flow_key(&fwd_key, ifindex, inner_is_v6, saddr, daddr,
-		       inner_sport, inner_dport, inner_proto);
+	build_flow_key(&fwd_key, ifindex, inner_is_v6, t.saddr, t.daddr,
+		       t.sport, t.dport, t.proto);
 
 	/* eth+ip+udp+geneve+opts is now OUTER_HDR_LEN exactly — opt_len was
 	 * just verified to be GWLB_OPTS_LEN, not merely bounded by it — so the
@@ -329,45 +305,48 @@ int decap(struct xdp_md *ctx)
 	 * included (see the comment on struct outer_hdr_cache). */
 	struct outer_hdr_cache cache;
 	__builtin_memset(&cache, 0, sizeof(cache));
-	if (bpf_xdp_load_bytes(ctx, 0, cache.hdr, OUTER_HDR_LEN)) {
-		increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_PACKETS, 1);
-		increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
-		return XDP_DROP;
+	if (cache_flow) {
+		if (bpf_xdp_load_bytes(ctx, 0, cache.hdr, OUTER_HDR_LEN)) {
+			increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_PACKETS, 1);
+			increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
+			return XDP_DROP;
+		}
+
+		/* Pre-swap the addressing that the eventual reply will need
+		 * reversed, so encap can replay this cache onto the wire
+		 * completely unmodified. Doing it here rather than in encap
+		 * means it runs once per request instead of once per reply — a
+		 * real saving whenever a flow's traffic is asymmetric (e.g. a
+		 * bulk download's data packets outnumber its acks), and never a
+		 * loss otherwise. */
+		struct ethhdr *cache_eth = (struct ethhdr *)cache.hdr;
+
+		__u8 dst_mac[6], src_mac[6];
+		__builtin_memcpy(dst_mac, cache_eth->h_dest, 6);
+		__builtin_memcpy(src_mac, cache_eth->h_source, 6);
+		__builtin_memcpy(cache_eth->h_dest, src_mac, 6);
+		__builtin_memcpy(cache_eth->h_source, dst_mac, 6);
+
+		/* saddr/daddr sit at a 2-byte-shy-of-4-aligned offset within
+		 * cache.hdr (14-byte Ethernet header, then a 20-byte IP header)
+		 * — kept in plain __u8* + memcpy terms, like the MAC swap above,
+		 * rather than a typed struct iphdr* scalar access: the verifier
+		 * accepts unaligned access through a packet pointer but rejects
+		 * it for a stack buffer like this one. */
+		__u8 *ip_saddr = cache.hdr + sizeof(struct ethhdr) + __builtin_offsetof(struct iphdr, saddr);
+		__u8 *ip_daddr = cache.hdr + sizeof(struct ethhdr) + __builtin_offsetof(struct iphdr, daddr);
+
+		__u8 saddr_bytes[4], daddr_bytes[4];
+		__builtin_memcpy(saddr_bytes, ip_saddr, 4);
+		__builtin_memcpy(daddr_bytes, ip_daddr, 4);
+		__builtin_memcpy(ip_saddr, daddr_bytes, 4);
+		__builtin_memcpy(ip_daddr, saddr_bytes, 4);
 	}
 
-	/* Pre-swap the addressing that the eventual reply will need reversed,
-	 * so encap can replay this cache onto the wire completely unmodified.
-	 * Doing it here rather than in encap means it runs once per request
-	 * instead of once per reply — a real saving whenever a flow's traffic
-	 * is asymmetric (e.g. a bulk download's data packets outnumber its
-	 * acks), and never a loss otherwise. */
-	struct ethhdr *cache_eth = (struct ethhdr *)cache.hdr;
-
-	__u8 dst_mac[6], src_mac[6];
-	__builtin_memcpy(dst_mac, cache_eth->h_dest, 6);
-	__builtin_memcpy(src_mac, cache_eth->h_source, 6);
-	__builtin_memcpy(cache_eth->h_dest, src_mac, 6);
-	__builtin_memcpy(cache_eth->h_source, dst_mac, 6);
-
-	/* saddr/daddr sit at a 2-byte-shy-of-4-aligned offset within cache.hdr
-	 * (14-byte Ethernet header, then a 20-byte IP header) — kept in plain
-	 * __u8* + memcpy terms, like the MAC swap above, rather than a typed
-	 * struct iphdr* scalar access: the verifier accepts unaligned access
-	 * through a packet pointer (as _encap.c's new_ip used to rely on) but
-	 * rejects it for a stack buffer like this one. */
-	__u8 *ip_saddr = cache.hdr + sizeof(struct ethhdr) + __builtin_offsetof(struct iphdr, saddr);
-	__u8 *ip_daddr = cache.hdr + sizeof(struct ethhdr) + __builtin_offsetof(struct iphdr, daddr);
-
-	__u8 saddr_bytes[4], daddr_bytes[4];
-	__builtin_memcpy(saddr_bytes, ip_saddr, 4);
-	__builtin_memcpy(daddr_bytes, ip_daddr, 4);
-	__builtin_memcpy(ip_saddr, daddr_bytes, 4);
-	__builtin_memcpy(ip_daddr, saddr_bytes, 4);
-
-	bpf_map_update_elem(&flow_state, &fwd_key, &cache, BPF_ANY);
-
 	/* Strip everything through the GENEVE options, then reopen room for a
-	 * synthesized L2 header, leaving [new eth hdr][inner IP packet]. */
+	 * synthesized L2 header, leaving [new eth hdr][inner IP packet]. Done
+	 * before publishing to flow_state: if this fails, the packet is dropped
+	 * undelivered, so there must be no cache entry for it. */
 	if (bpf_xdp_adjust_head(ctx, (int)(OUTER_HDR_LEN - sizeof(struct ethhdr)))) {
 		increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_PACKETS, 1);
 		increment_metric(ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
@@ -385,6 +364,16 @@ int decap(struct xdp_md *ctx)
 	__builtin_memcpy(new_eth->h_dest, info->dst, 6);
 	__builtin_memcpy(new_eth->h_source, info->src, 6);
 	new_eth->h_proto = inner_proto_be;
+
+	/* Only (re)write the entry when its encapsulation actually changed
+	 * (see outer_hdr_stable_eq). The lookup also refreshes the entry's LRU
+	 * recency, so a flow that keeps arriving is never aged out. */
+	if (cache_flow) {
+		struct outer_hdr_cache *cur = bpf_map_lookup_elem(&flow_state, &fwd_key);
+
+		if (!cur || !outer_hdr_stable_eq(cur, &cache))
+			bpf_map_update_elem(&flow_state, &fwd_key, &cache, BPF_ANY);
+	}
 
 	increment_metric(ifindex, DECAP_CNT_OK_PACKETS, 1);
 	increment_metric(ifindex, DECAP_CNT_OK_BYTES, frame_len);

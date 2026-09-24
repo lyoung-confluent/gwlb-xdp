@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"net/netip"
 	"os"
 	"runtime"
@@ -30,19 +31,31 @@ func ParseIPv4CIDR(cidr string) (netip.Prefix, error) {
 	return p.Masked(), nil
 }
 
+// ParseVPCEID parses a VPC endpoint ID into the GWLB ID decap matches
+// against GENEVE's ENI ID option: its hex suffix, in either AWS's current
+// 17-hex-digit form (vpce-0123456789abcdef0) or the legacy 8-hex-digit one
+// (vpce-1a2b3c4d). Hex digits may be either case.
 func ParseVPCEID(vpceID string) (gwlbID uint64, err error) {
 	hex, ok := strings.CutPrefix(vpceID, "vpce-")
-	if !ok || len(hex) != 17 {
-		return 0, fmt.Errorf("%q isn't a valid vpce id (want vpce-<17 hex digits>)", vpceID)
+	if !ok || (len(hex) != 17 && len(hex) != 8) {
+		return 0, fmt.Errorf("%q isn't a valid vpce id (want vpce-<17 or 8 hex digits>)", vpceID)
 	}
 	gwlbID, err = strconv.ParseUint(hex, 16, 64)
 	if err != nil {
-		return 0, fmt.Errorf("%q isn't a valid vpce id (want vpce-<17 hex digits>)", vpceID)
+		return 0, fmt.Errorf("%q isn't a valid vpce id (want vpce-<17 or 8 hex digits>)", vpceID)
 	}
 	return gwlbID, nil
 }
 
+// FormatVPCEID is ParseVPCEID's inverse, producing the canonical lowercase
+// spelling. An ID that fits in 32 bits is rendered in the legacy 8-digit
+// form: a current-form ID would need 13 leading zero digits to fit, which
+// its random suffix never has in practice, so this recovers the form AWS
+// actually issued rather than zero-padding a legacy ID to 17 digits.
 func FormatVPCEID(gwlbID uint64) string {
+	if gwlbID <= math.MaxUint32 {
+		return fmt.Sprintf("vpce-%08x", gwlbID)
+	}
 	return fmt.Sprintf("vpce-%017x", gwlbID)
 }
 

@@ -168,6 +168,12 @@ func openGWLBSocket(t *testing.T, gwlbIface *net.Interface) int {
 	}); err != nil {
 		t.Fatalf("unix.Bind failed: %v", err)
 	}
+	// Room for a burst of jumbo replies (see TestTCPBulkReply): the default
+	// receive buffer holds only a handful of ~9KB frames, and anything past
+	// it is dropped before the test ever reads it.
+	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUFFORCE, 8<<20); err != nil {
+		t.Fatalf("unix.SetsockoptInt(SO_RCVBUFFORCE) failed: %v", err)
+	}
 	return fd
 }
 
@@ -205,6 +211,9 @@ var backendAddrs = []backendAddr{
 // backend/appliance. Each received datagram's payload is passed through
 // transform before being echoed back, so a test can tell which ENI's backend
 // actually answered — pass bytes.Clone (or similar) for a plain echo.
+//
+// Each family's connected route gets a route MTU of bpf.GWLBMTU, the way a
+// real deployment's --script would set its routes up (see README.md).
 //
 // Each family's client address gets a permanent (never-ARPed/never-NDP'd)
 // neighbor entry on the ENI's own veth-inner, mapped to clientMAC: nothing
@@ -278,6 +287,23 @@ func provisionENI(t *testing.T, gwlbID uint64, isolated bool, echoPort int, clie
 		if err := nlh.AddrAdd(innerLink, addr); err != nil {
 			t.Fatalf("(*netlink.Handle).AddrAdd(%q) failed: %v", b.cidr, err)
 		}
+		// Size the backend's own traffic to GWLB's documented MTU with a
+		// route MTU, as README.md asks of real deployments: the veth's
+		// interface MTU is larger (see cmd/add.go). Replaces the kernel's
+		// own connected route (metric 0 for v4, 256 for v6).
+		prio := 0
+		if b.family == netlink.FAMILY_V6 {
+			prio = 256
+		}
+		if err := nlh.RouteReplace(&netlink.Route{
+			LinkIndex: innerLink.Attrs().Index,
+			Dst:       &net.IPNet{IP: addr.IP.Mask(addr.Mask), Mask: addr.Mask},
+			Scope:     netlink.SCOPE_LINK,
+			Priority:  prio,
+			MTU:       bpf.GWLBMTU,
+		}); err != nil {
+			t.Fatalf("(*netlink.Handle).RouteReplace for %q failed: %v", b.cidr, err)
+		}
 		if err := nlh.NeighAdd(&netlink.Neigh{
 			LinkIndex:    innerLink.Attrs().Index,
 			Family:       b.family,
@@ -303,7 +329,7 @@ func provisionENI(t *testing.T, gwlbID uint64, isolated bool, echoPort int, clie
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			buf := make([]byte, 2048)
+			buf := make([]byte, 65536)
 			for {
 				n, raddr, err := conn.ReadFromUDP(buf)
 				if err != nil {
@@ -356,7 +382,7 @@ func waitForReply(t *testing.T, fd int, uplinkMAC net.HardwareAddr, timeout time
 		t.Fatalf("unix.SetsockoptTimeval failed: %v", err)
 	}
 
-	buf := make([]byte, 2048)
+	buf := make([]byte, maxFrameLen)
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		n, err := unix.Read(fd, buf)
@@ -390,7 +416,7 @@ func waitForICMPReply(t *testing.T, fd int, uplinkMAC net.HardwareAddr, timeout 
 		t.Fatalf("unix.SetsockoptTimeval failed: %v", err)
 	}
 
-	buf := make([]byte, 2048)
+	buf := make([]byte, maxFrameLen)
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		n, err := unix.Read(fd, buf)
@@ -511,10 +537,11 @@ func assertOKMetrics(t *testing.T, outerIfindex uint32, reqFrameLen, payloadLen 
 	if got := metricSum(t, "encap_ok_packets", outerIfindex); got != 1 {
 		t.Errorf("encap_ok_packets[outer ifindex] = %d, want 1", got)
 	}
-	// encap counts frame_len as the reply arrived on veth-outer: its own
-	// 14-byte veth ethhdr plus the inner IP(20)/UDP(8)/payload the echo
-	// server sent, before encap ever touches the packet (see _encap.c).
-	wantEncapBytes := uint64(14 + 20 + 8 + payloadLen)
+	// encap counts the reply as it leaves the uplink: the inner
+	// IP(20)/UDP(8)/payload the echo server sent, behind the full 82-byte
+	// outer eth/IP/UDP/GENEVE header encap restored (see _encap.c) — the
+	// same basis decap_ok_bytes uses for the request.
+	wantEncapBytes := uint64(82 + 20 + 8 + payloadLen)
 	if got := metricSum(t, "encap_ok_bytes", outerIfindex); got != wantEncapBytes {
 		t.Errorf("encap_ok_bytes[outer ifindex] = %d, want %d", got, wantEncapBytes)
 	}
@@ -880,7 +907,7 @@ func TestNoNetns(t *testing.T) {
 }
 
 // TestICMPEcho drives an ICMP echo request through decap and back through
-// encap as an echo reply — decap/encap's ICMP support (parse_l4_ports in
+// encap as an echo reply — decap/encap's ICMP support (parse_l4 in
 // bpf/geneve_defs.h) keys the flow by the echo's own id, the same way a
 // TCP/UDP flow is keyed by port. Nothing needs to run in the ENI's netns to
 // answer the ping: the kernel replies on its own to an echo request
@@ -941,7 +968,7 @@ func TestICMPEcho(t *testing.T) {
 
 	// Outer/inner addressing swapped exactly as a UDP reply's would be (see
 	// assertValidReply) — decap's flow_key doesn't treat ICMP specially
-	// beyond parse_l4_ports, so the same NAT-orientation lookup applies.
+	// beyond parse_l4, so the same NAT-orientation lookup applies.
 	if !bytes.Equal(reply.outerDstMAC, gwlbIface.HardwareAddr) {
 		t.Errorf("reply outer dst MAC = %v, want %v (this harness's own)", reply.outerDstMAC, gwlbIface.HardwareAddr)
 	}
@@ -975,7 +1002,7 @@ func waitForReplyV6(t *testing.T, fd int, uplinkMAC net.HardwareAddr, timeout ti
 		t.Fatalf("unix.SetsockoptTimeval failed: %v", err)
 	}
 
-	buf := make([]byte, 2048)
+	buf := make([]byte, maxFrameLen)
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		n, err := unix.Read(fd, buf)

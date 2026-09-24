@@ -49,6 +49,7 @@ type bpfMetricKey struct {
 type bpfOuterHdrCache struct {
 	_   structs.HostLayout
 	Hdr [82]uint8
+	_   [2]byte
 }
 
 // Names of all BPF objects in the ELF.
@@ -61,6 +62,7 @@ const (
 	bpfProgDecap            = "decap"
 	bpfVarAllowedOriginAddr = "allowed_origin_addr"
 	bpfVarAllowedOriginMask = "allowed_origin_mask"
+	bpfVarMaxInnerLen       = "max_inner_len"
 )
 
 // loadBpf returns the embedded CollectionSpec for bpf.
@@ -123,6 +125,7 @@ type bpfMapSpecs struct {
 type bpfVariableSpecs struct {
 	AllowedOriginAddr *ebpf.VariableSpec `ebpf:"allowed_origin_addr"`
 	AllowedOriginMask *ebpf.VariableSpec `ebpf:"allowed_origin_mask"`
+	MaxInnerLen       *ebpf.VariableSpec `ebpf:"max_inner_len"`
 }
 
 // bpfObjects contains all objects after they have been loaded into the kernel.
@@ -164,6 +167,7 @@ func (m *bpfMaps) Close() error {
 type bpfVariables struct {
 	AllowedOriginAddr *ebpf.Variable `ebpf:"allowed_origin_addr"`
 	AllowedOriginMask *ebpf.Variable `ebpf:"allowed_origin_mask"`
+	MaxInnerLen       *ebpf.Variable `ebpf:"max_inner_len"`
 }
 
 // bpfPrograms contains all programs after they have been loaded into the kernel.

@@ -14,11 +14,14 @@ import (
 
 // Config configures encap before it's loaded. flow_state/metrics aren't
 // sized here — Load reads their sizes back from decap's pins (see Load).
+// frag_state is encap's own, and fixed-size.
 type Config struct {
 	// Transparent hardcodes every ENI on this box as a transparent
 	// appliance (reply comes back with the same 5-tuple, not swapped).
 	Transparent bool
-	// Uplink is the physical interface encap sends replies out of.
+	// Uplink is the physical interface encap sends replies out of. Its MTU
+	// caps the largest reply encap will encapsulate (see max_inner_len in
+	// _encap.c).
 	Uplink *net.Interface
 }
 
@@ -62,6 +65,15 @@ func Load(cfg Config) (*Program, error) {
 
 	if err := spec.Variables[bpfVarUplinkIfindex].Set(uint32(cfg.Uplink.Index)); err != nil {
 		return nil, fmt.Errorf("(*ebpf.VariableSpec).Set for uplink_ifindex failed: %w", err)
+	}
+
+	// The largest reply that still fits the uplink once encapsulated.
+	maxInnerLen, err := bpf.MaxInnerLen(cfg.Uplink.MTU)
+	if err != nil {
+		return nil, fmt.Errorf("bpf.MaxInnerLen for %s failed: %w", cfg.Uplink.Name, err)
+	}
+	if err := spec.Variables[bpfVarMaxInnerLen].Set(uint32(maxInnerLen)); err != nil {
+		return nil, fmt.Errorf("(*ebpf.VariableSpec).Set for max_inner_len failed: %w", err)
 	}
 
 	var objs bpfObjects

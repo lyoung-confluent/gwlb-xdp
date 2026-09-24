@@ -42,6 +42,7 @@ type bpfMetricKey struct {
 type bpfOuterHdrCache struct {
 	_   structs.HostLayout
 	Hdr [82]uint8
+	_   [2]byte
 }
 
 // Names of all BPF objects in the ELF.
@@ -49,9 +50,11 @@ type bpfOuterHdrCache struct {
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
 	bpfMapFlowState     = "flow_state"
+	bpfMapFragState     = "frag_state"
 	bpfMapMetrics       = "metrics"
 	bpfProgEncap        = "encap"
 	bpfVarEniMode       = "eni_mode"
+	bpfVarMaxInnerLen   = "max_inner_len"
 	bpfVarUplinkIfindex = "uplink_ifindex"
 )
 
@@ -105,6 +108,7 @@ type bpfProgramSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfMapSpecs struct {
 	FlowState *ebpf.MapSpec `ebpf:"flow_state"`
+	FragState *ebpf.MapSpec `ebpf:"frag_state"`
 	Metrics   *ebpf.MapSpec `ebpf:"metrics"`
 }
 
@@ -113,6 +117,7 @@ type bpfMapSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfVariableSpecs struct {
 	EniMode       *ebpf.VariableSpec `ebpf:"eni_mode"`
+	MaxInnerLen   *ebpf.VariableSpec `ebpf:"max_inner_len"`
 	UplinkIfindex *ebpf.VariableSpec `ebpf:"uplink_ifindex"`
 }
 
@@ -137,12 +142,14 @@ func (o *bpfObjects) Close() error {
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfMaps struct {
 	FlowState *ebpf.Map `ebpf:"flow_state"`
+	FragState *ebpf.Map `ebpf:"frag_state"`
 	Metrics   *ebpf.Map `ebpf:"metrics"`
 }
 
 func (m *bpfMaps) Close() error {
 	return _BpfClose(
 		m.FlowState,
+		m.FragState,
 		m.Metrics,
 	)
 }
@@ -152,6 +159,7 @@ func (m *bpfMaps) Close() error {
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfVariables struct {
 	EniMode       *ebpf.Variable `ebpf:"eni_mode"`
+	MaxInnerLen   *ebpf.Variable `ebpf:"max_inner_len"`
 	UplinkIfindex *ebpf.Variable `ebpf:"uplink_ifindex"`
 }
 

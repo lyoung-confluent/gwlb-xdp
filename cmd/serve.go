@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 
 	"github.com/lyoung-confluent/gwlb-xdp/bpf"
 	"github.com/lyoung-confluent/gwlb-xdp/bpf/decap"
@@ -88,10 +90,11 @@ func RunServe(ctx context.Context, healthAddr, statsdAddr string, interval time.
 
 	srv := &http.Server{
 		Addr: healthAddr,
-		// Liveness on any path: 200 while decap is attached, 503 otherwise.
+		// Liveness on any path: 200 while decap is attached to an uplink
+		// that's up with carrier, 503 otherwise.
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if !decap.Attached() {
-				http.Error(w, "decap not attached", http.StatusServiceUnavailable)
+			if err := checkHealth(); err != nil {
+				http.Error(w, err.Error(), http.StatusServiceUnavailable)
 				return
 			}
 			w.WriteHeader(http.StatusOK)
@@ -141,9 +144,8 @@ func flushGauges(conn net.Conn) error {
 		return err
 	}
 
-	// Group each interface's counters so they go out as one datagram. One
-	// interface has at most len(bpf.CounterNames) counters, so a datagram stays
-	// well under any UDP size limit — no chunking needed.
+	// Group each interface's counters so they go out together, split into as
+	// few datagrams as fit maxStatsdDatagram (see packLines).
 	perIface := make(map[uint32][]string)
 	for key, val := range cur {
 		// A row whose ifindex has no live interface (e.g. a veth deleted
@@ -162,11 +164,60 @@ func flushGauges(conn net.Conn) error {
 
 	var errs []error
 	for _, lines := range perIface {
-		if _, err := conn.Write([]byte(strings.Join(lines, "\n"))); err != nil {
-			errs = append(errs, fmt.Errorf("writing to statsd endpoint failed: %w", err))
+		for _, datagram := range packLines(lines, maxStatsdDatagram) {
+			if _, err := conn.Write([]byte(datagram)); err != nil {
+				errs = append(errs, fmt.Errorf("writing to statsd endpoint failed: %w", err))
+			}
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// maxStatsdDatagram caps each statsd datagram's payload at the common safe
+// size for a 1500-byte path MTU (1500 - IPv4 20 - UDP 8 - headroom), which
+// statsd servers' default read buffers also accommodate. One interface's
+// counters, each line carrying its full tag suffix, can exceed it.
+const maxStatsdDatagram = 1432
+
+// packLines joins lines with newlines into as few datagrams as possible,
+// each at most max bytes. A single line longer than max still goes out, alone
+// in its own datagram, rather than being dropped.
+func packLines(lines []string, max int) []string {
+	var datagrams []string
+	var cur strings.Builder
+	for _, line := range lines {
+		if cur.Len() > 0 && cur.Len()+1+len(line) > max {
+			datagrams = append(datagrams, cur.String())
+			cur.Reset()
+		}
+		if cur.Len() > 0 {
+			cur.WriteByte('\n')
+		}
+		cur.WriteString(line)
+	}
+	if cur.Len() > 0 {
+		datagrams = append(datagrams, cur.String())
+	}
+	return datagrams
+}
+
+// checkHealth reports why this box can't pass traffic, or nil if it can:
+// decap must still be attached, and the uplink it's attached to must be up
+// with carrier.
+func checkHealth() error {
+	ifindex, err := decap.UplinkIfindex()
+	if err != nil {
+		return fmt.Errorf("decap not attached: %w", err)
+	}
+	link, err := netlink.LinkByIndex(ifindex)
+	if err != nil {
+		return fmt.Errorf("uplink (ifindex %d) not found: %w", ifindex, err)
+	}
+	attrs := link.Attrs()
+	if attrs.Flags&net.FlagUp == 0 || attrs.RawFlags&unix.IFF_LOWER_UP == 0 {
+		return fmt.Errorf("uplink %s is down or has no carrier", attrs.Name)
+	}
+	return nil
 }
 
 // sampleCounters reads the pinned metrics map and returns each counter's

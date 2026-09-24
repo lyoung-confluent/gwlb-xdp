@@ -58,7 +58,7 @@ func buildGeneveOptions(eniID, attachmentID uint64, flowCookie uint32) []*layers
 
 // buildInnerICMPEchoRequest serializes an inner IPv4/ICMPv4 echo request —
 // pass it as requestParams.innerPacket to exercise decap/encap's ICMP
-// support (parse_l4_ports in bpf/geneve_defs.h), which keys the flow by the
+// support (parse_l4 in bpf/geneve_defs.h), which keys the flow by the
 // echo's own id the way UDP keys by port.
 func buildInnerICMPEchoRequest(srcIP, dstIP net.IP, id, seq uint16, payload []byte) ([]byte, error) {
 	innerIP := &layers.IPv4{
@@ -443,4 +443,90 @@ func parseICMPReply(frame []byte) (*icmpReplyPacket, error) {
 		icmpSeq:    icmp.Seq,
 		payload:    icmp.Payload,
 	}, nil
+}
+
+// buildInnerUDPv4 serializes an inner IPv4/UDP packet — the same packet
+// buildRequestFrame builds by default, for tests that need the bytes
+// themselves (e.g. to build several frames with different flow cookies).
+func buildInnerUDPv4(srcIP, dstIP net.IP, srcPort, dstPort uint16, payload []byte) ([]byte, error) {
+	innerIP := &layers.IPv4{
+		Version:  4,
+		TTL:      64,
+		Protocol: layers.IPProtocolUDP,
+		SrcIP:    srcIP,
+		DstIP:    dstIP,
+	}
+	innerUDP := &layers.UDP{
+		SrcPort: layers.UDPPort(srcPort),
+		DstPort: layers.UDPPort(dstPort),
+	}
+	if err := innerUDP.SetNetworkLayerForChecksum(innerIP); err != nil {
+		return nil, fmt.Errorf("SetNetworkLayerForChecksum for inner UDP failed: %w", err)
+	}
+	buf := gopacket.NewSerializeBuffer()
+	if err := gopacket.SerializeLayers(buf, serializeOpts, innerIP, innerUDP, gopacket.Payload(payload)); err != nil {
+		return nil, fmt.Errorf("serializing inner IPv4 UDP packet failed: %w", err)
+	}
+	return append([]byte(nil), buf.Bytes()...), nil
+}
+
+// tcpSegment describes one inner IPv4/TCP segment for buildInnerTCPv4.
+type tcpSegment struct {
+	srcIP, dstIP     net.IP
+	srcPort, dstPort uint16
+	seq, ack         uint32
+	syn, ackFlag     bool
+	window           uint16
+	mss              uint16 // MSS option to advertise; 0 for none
+	payload          []byte
+}
+
+// buildInnerTCPv4 serializes an inner IPv4/TCP segment, for driving a real
+// TCP connection to a server in the ENI's netns (see TestTCPBulkReply).
+func buildInnerTCPv4(s tcpSegment) ([]byte, error) {
+	innerIP := &layers.IPv4{
+		Version:  4,
+		TTL:      64,
+		Protocol: layers.IPProtocolTCP,
+		SrcIP:    s.srcIP,
+		DstIP:    s.dstIP,
+	}
+	tcp := &layers.TCP{
+		SrcPort: layers.TCPPort(s.srcPort),
+		DstPort: layers.TCPPort(s.dstPort),
+		Seq:     s.seq,
+		Ack:     s.ack,
+		SYN:     s.syn,
+		ACK:     s.ackFlag,
+		Window:  s.window,
+	}
+	if s.mss != 0 {
+		mss := make([]byte, 2)
+		binary.BigEndian.PutUint16(mss, s.mss)
+		tcp.Options = []layers.TCPOption{{OptionType: layers.TCPOptionKindMSS, OptionLength: 4, OptionData: mss}}
+	}
+	if err := tcp.SetNetworkLayerForChecksum(innerIP); err != nil {
+		return nil, fmt.Errorf("SetNetworkLayerForChecksum for inner TCP failed: %w", err)
+	}
+	buf := gopacket.NewSerializeBuffer()
+	if err := gopacket.SerializeLayers(buf, serializeOpts, innerIP, tcp, gopacket.Payload(s.payload)); err != nil {
+		return nil, fmt.Errorf("serializing inner IPv4 TCP segment failed: %w", err)
+	}
+	return append([]byte(nil), buf.Bytes()...), nil
+}
+
+// geneveInner decodes frame as an outer eth/IPv4/UDP/GENEVE packet and
+// returns its raw GENEVE option bytes, the raw inner packet (GENEVE's
+// payload), and whether the outer IP checksum is valid — for tests that
+// inspect inner packets gopacket's layer decoders don't model (ICMP errors'
+// quoted packets, fragments).
+func geneveInner(frame []byte) (opts, inner []byte, outerIPChecksumValid bool, err error) {
+	_, outerIP, _, gn, err := decodeOuterFrame(frame)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if len(gn.Contents) < 8 {
+		return nil, nil, false, fmt.Errorf("truncated GENEVE header")
+	}
+	return append([]byte(nil), gn.Contents[8:]...), gn.LayerPayload(), verifyIPChecksum(outerIP.Contents), nil
 }
