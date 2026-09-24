@@ -58,15 +58,18 @@ type counterKey struct {
 
 // RunServe runs the HTTP liveness server on healthAddr — the command's primary
 // job — and, when interval > 0, also samples the pinned BPF counter map every
-// interval and pushes each counter's current value to statsdAddr as a statsd
-// gauge (the shape the CloudWatch agent turns into a CloudWatch metric),
-// batching one interface's counters per datagram. When interval <= 0 no statsd
-// connection is made and only health is served. Blocks until ctx is cancelled
-// (SIGINT) or the health server fails.
+// interval and pushes how much each counter grew since the previous sample to
+// statsdAddr as a statsd counter (the shape the CloudWatch agent turns into a
+// CloudWatch metric, summed per period), batching one interface's counters per
+// datagram. When interval <= 0 no statsd connection is made and only health is
+// served. Blocks until ctx is cancelled (SIGINT/SIGTERM) or the health server
+// fails.
 //
-// Gauge values are the counters' running cumulative totals (they reset only
-// when the programs are reloaded); take a rate/delta at query time for
-// per-period numbers.
+// Deltas rather than the BPF map's cumulative totals: the totals drop back to
+// zero whenever an ENI is removed and re-added or the programs are reloaded,
+// and CloudWatch has no reset-aware rate() to take over raw totals. The first
+// sample only sets the baseline, so starting serve on a long-running box
+// doesn't push everything counted so far as one burst.
 func RunServe(ctx context.Context, healthAddr, statsdAddr string, interval time.Duration) error {
 	// Metrics push is opt-out via a non-positive interval: dial statsd and arm
 	// the ticker only when enabled. A nil tick channel never fires, so the
@@ -75,6 +78,7 @@ func RunServe(ctx context.Context, healthAddr, statsdAddr string, interval time.
 	// agent is up.
 	var conn net.Conn
 	var tick <-chan time.Time
+	var prev map[counterKey]uint64 // nil until the first sample
 	if interval > 0 {
 		c, err := net.Dial("udp", statsdAddr)
 		if err != nil {
@@ -119,7 +123,8 @@ func RunServe(ctx context.Context, healthAddr, statsdAddr string, interval time.
 		case err := <-srvErr:
 			return fmt.Errorf("health server on %q failed: %w", healthAddr, err)
 		case <-tick:
-			if err := flushGauges(conn); err != nil {
+			var err error
+			if prev, err = flushCounters(conn, prev); err != nil {
 				// Keep the daemon alive across a transient failure so a
 				// momentary hiccup doesn't take metrics down.
 				fmt.Fprintf(os.Stderr, "gwlb-xdp: serve: %v\n", err)
@@ -128,49 +133,68 @@ func RunServe(ctx context.Context, healthAddr, statsdAddr string, interval time.
 	}
 }
 
-// flushGauges samples every counter and writes its current value to conn as a
-// statsd gauge, batching all of one interface's counters into a single UDP
-// datagram (newline-separated lines — the DogStatsD multi-metric form). A
-// sampling failure returns early; per-datagram write failures are joined and
-// returned once the rest have been tried (a dropped statsd datagram is a lost
-// sample, inherent to UDP).
-func flushGauges(conn net.Conn) error {
+// flushCounters samples every counter and writes how much it grew since prev
+// (the previous sample) to conn as statsd counters (see counterLines),
+// batching all of one interface's counters into a single UDP datagram
+// (newline-separated lines — the DogStatsD multi-metric form). It returns the
+// new sample, to pass back as prev next time. With a nil prev nothing is
+// written: this sample is only the baseline.
+//
+// A sampling failure returns prev unchanged, so the next tick's deltas still
+// cover the whole gap. Per-datagram write failures are joined and returned
+// once the rest have been tried (a dropped statsd datagram is a lost sample,
+// inherent to UDP).
+func flushCounters(conn net.Conn, prev map[counterKey]uint64) (map[counterKey]uint64, error) {
 	cur, err := sampleCounters()
 	if err != nil {
-		return err
+		return prev, err
+	}
+	if prev == nil {
+		return cur, nil
 	}
 	labels, err := interfaceTags()
 	if err != nil {
-		return err
-	}
-
-	// Group each interface's counters so they go out together, split into as
-	// few datagrams as fit maxStatsdDatagram (see packLines).
-	perIface := make(map[uint32][]string)
-	for key, val := range cur {
-		// A row whose ifindex has no live interface (e.g. a veth deleted
-		// out-of-band, or a remove whose metrics sweep failed) has no tags —
-		// skip it rather than emit a dimensionless series, matching what the
-		// old Prometheus exporter did.
-		tags, ok := labels[key.ifindex]
-		if !ok {
-			continue
-		}
-		// One DogStatsD gauge line: gwlb_xdp.<name>:<value>|g|#tag:val,... —
-		// tags is the pre-formatted "|#..." suffix (see interfaceTags).
-		perIface[key.ifindex] = append(perIface[key.ifindex],
-			fmt.Sprintf("gwlb_xdp.%s:%d|g%s", bpf.CounterNames[key.counter], val, tags))
+		return prev, err
 	}
 
 	var errs []error
-	for _, lines := range perIface {
+	for _, lines := range counterLines(cur, prev, labels) {
 		for _, datagram := range packLines(lines, maxStatsdDatagram) {
 			if _, err := conn.Write([]byte(datagram)); err != nil {
 				errs = append(errs, fmt.Errorf("writing to statsd endpoint failed: %w", err))
 			}
 		}
 	}
-	return errors.Join(errs...)
+	return cur, errors.Join(errs...)
+}
+
+// counterLines returns one DogStatsD counter line per row of cur — how much
+// it grew since prev — grouped by ifindex so each interface's counters can go
+// out together. labels holds each ifindex's pre-formatted "|#..." tag suffix
+// (see interfaceTags).
+//
+// A row missing from prev is new since then and started at zero, so its
+// delta is its whole value; so is a row whose value went down, which can
+// only mean it was swept (ENI removed) and recreated in between.
+func counterLines(cur, prev map[counterKey]uint64, labels map[uint32]string) map[uint32][]string {
+	perIface := make(map[uint32][]string)
+	for key, val := range cur {
+		// A row whose ifindex has no live interface (e.g. a veth deleted
+		// out-of-band, or a remove whose metrics sweep failed) has no tags —
+		// skip it rather than emit a dimensionless series.
+		tags, ok := labels[key.ifindex]
+		if !ok {
+			continue
+		}
+		delta := val
+		if p := prev[key]; val >= p {
+			delta = val - p
+		}
+		// gwlb_xdp.<name>:<delta>|c|#tag:val,...
+		perIface[key.ifindex] = append(perIface[key.ifindex],
+			fmt.Sprintf("gwlb_xdp.%s:%d|c%s", bpf.CounterNames[key.counter], delta, tags))
+	}
+	return perIface
 }
 
 // maxStatsdDatagram caps each statsd datagram's payload at the common safe

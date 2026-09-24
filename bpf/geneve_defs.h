@@ -71,8 +71,18 @@ struct geneve_opt_hdr {
 #define IPPROTO_ICMPV6			58
 
 /* linux/ip.h: IPv4 frag_off bits (host order). */
+#define IP_DF				0x4000
 #define IP_MF				0x2000
 #define IP_OFFSET			0x1FFF
+
+/* linux/ip.h: the ECN field's bits within the IPv4 TOS byte. */
+#define IPTOS_ECN_MASK			0x03
+
+/* The outer IPv4 TTL every reply goes out with, Linux's default
+ * (net.ipv4.ip_default_ttl) — the same as a reply sent from a normal UDP
+ * socket, the way AWS's gwlbtun reference sends them. See the TTL/ECN/DF/ID
+ * rewrite in _decap.c. */
+#define OUTER_REPLY_TTL			64
 
 /* linux/ipv6.h: IPv6 fragment header frag_off bits (host order). */
 #define IP6_MF				0x0001
@@ -158,8 +168,9 @@ struct flow_key {
 
 /*
  * Cached outer eth+ip+udp+geneve+opts header, stored by decap with its
- * Ethernet dst/src and IP saddr/daddr already swapped into reply orientation
- * (see _decap.c) so encap can replay it onto the wire completely unmodified
+ * Ethernet dst/src and IP saddr/daddr already swapped into reply orientation,
+ * and its TTL, ECN, DF and ID already set to what a reply carries (see
+ * _decap.c), so encap can replay it onto the wire completely unmodified
  * — only fields that depend on that specific reply's own size (IP/UDP
  * length, IP checksum) still get touched, in _encap.c, after the replay.
  * Shared by v4 and v6 inner flows — the outer header doesn't vary with the

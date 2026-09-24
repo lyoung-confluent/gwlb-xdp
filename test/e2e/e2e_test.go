@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"bytes"
+	"encoding/binary"
 	"net"
 	"os"
 	"runtime"
@@ -22,10 +23,29 @@ import (
 )
 
 // flowStateCount returns the number of live entries in the pinned flow_state
-// map. Used only to assert `remove` sweeps an ENI's cached flows (see
-// TestRemove); walking the whole map is fine at test scale, and keeps that
-// scan out of production code now that the counters ship over statsd.
+// map. Walking the whole map is fine at test scale.
 func flowStateCount(t *testing.T) int {
+	t.Helper()
+	return len(flowStateIfindexes(t))
+}
+
+// flowStateCountFor returns how many live flow_state entries are keyed by
+// ifindex — used to assert `remove` sweeps exactly one ENI's cached flows
+// (see TestRemove).
+func flowStateCountFor(t *testing.T, ifindex uint32) int {
+	t.Helper()
+	var n int
+	for _, i := range flowStateIfindexes(t) {
+		if i == ifindex {
+			n++
+		}
+	}
+	return n
+}
+
+// flowStateIfindexes returns the ifindex (struct flow_key's leading field)
+// of every live flow_state entry.
+func flowStateIfindexes(t *testing.T) []uint32 {
 	t.Helper()
 	m, err := ebpf.LoadPinnedMap(bpf.PinDir+"/flow_state", nil)
 	if err != nil {
@@ -33,7 +53,7 @@ func flowStateCount(t *testing.T) int {
 	}
 	defer m.Close()
 
-	var count int
+	var ifindexes []uint32
 	var key interface{}
 	for {
 		next, err := m.NextKeyBytes(key)
@@ -41,10 +61,10 @@ func flowStateCount(t *testing.T) int {
 			t.Fatalf("(*ebpf.Map).NextKeyBytes for flow_state failed: %v", err)
 		}
 		if next == nil {
-			return count
+			return ifindexes
 		}
 		key = next
-		count++
+		ifindexes = append(ifindexes, binary.NativeEndian.Uint32(next[:4]))
 	}
 }
 
@@ -221,9 +241,16 @@ var backendAddrs = []backendAddr{
 // in the kernel's neighbor queue forever instead of ever reaching encap.
 func provisionENI(t *testing.T, gwlbID uint64, isolated bool, echoPort int, clientMAC string, transform func([]byte) []byte) eni {
 	t.Helper()
+	return provisionENIWithScript(t, gwlbID, isolated, "", echoPort, clientMAC, transform)
+}
+
+// provisionENIWithScript is provisionENI, passing scriptPath to `add` as its
+// --script.
+func provisionENIWithScript(t *testing.T, gwlbID uint64, isolated bool, scriptPath string, echoPort int, clientMAC string, transform func([]byte) []byte) eni {
+	t.Helper()
 
 	vpceID := cmd.FormatVPCEID(gwlbID)
-	if err := cmd.RunAdd(vpceID, "", isolated); err != nil {
+	if err := cmd.RunAdd(vpceID, scriptPath, isolated); err != nil {
 		t.Fatalf("cmd.RunAdd(%q, isolated=%v) failed: %v", vpceID, isolated, err)
 	}
 
@@ -500,6 +527,20 @@ func assertValidReply(t *testing.T, reply *replyPacket, gwlbIface *net.Interface
 	if reply.outerUDPChecksum != 0 {
 		t.Errorf("reply outer UDP checksum = %#04x, want 0 (zeroed by encap, see _encap.c)", reply.outerUDPChecksum)
 	}
+	// A fresh datagram's TTL, ECN, DF and ID, not the request's (see the
+	// rewrite in _decap.c and requestOuterTTL/TOS/ID in packet.go).
+	if reply.outerTTL != 64 {
+		t.Errorf("reply outer TTL = %d, want 64 (not the request's %d)", reply.outerTTL, requestOuterTTL)
+	}
+	if want := uint8(requestOuterTOS &^ 0x03); reply.outerTOS != want {
+		t.Errorf("reply outer TOS = %#02x, want %#02x (request's DSCP kept, its ECN CE mark cleared)", reply.outerTOS, want)
+	}
+	if reply.outerFlags != layers.IPv4DontFragment {
+		t.Errorf("reply outer IP flags = %v, want DF only", reply.outerFlags)
+	}
+	if reply.outerID != 0 {
+		t.Errorf("reply outer IP ID = %#04x, want 0 (not the request's %#04x)", reply.outerID, requestOuterID)
+	}
 	if !bytes.Equal(reply.opts, reqOpts) {
 		t.Errorf("reply GENEVE options = %x, want %x (verbatim replay of the request's)", reply.opts, reqOpts)
 	}
@@ -724,6 +765,45 @@ func TestEndToEnd(t *testing.T) {
 			t.Errorf("decap_drop_malformed_bytes[uplink ifindex] = %d, want %d", got, beforeBytes+uint64(len(badFrame)))
 		}
 	})
+
+	t.Run("outer first fragment is dropped", func(t *testing.T) {
+		badFrame, err := buildRequestFrame(requestParams{
+			outerSrcMAC:  gwlbIface.HardwareAddr,
+			outerDstMAC:  uplinkIface.HardwareAddr,
+			outerSrcIP:   net.ParseIP(fakeGWLBOuterSrcIP),
+			outerDstIP:   net.ParseIP(fakeGWLBOuterDstIP),
+			outerSrcPort: fakeOuterSrcPort,
+			vni:          [3]byte{0, 0, 0},
+			opts:         buildGeneveOptions(gwlbID, fakeAttachmentID, fakeFlowCookie),
+			innerSrcIP:   net.ParseIP(fakeClientIP),
+			innerDstIP:   net.ParseIP(echoServerIP),
+			innerSrcPort: fakeClientPort + 1, // a flow of its own, not yet cached
+			innerDstPort: echoServerPort,
+			payload:      payload,
+		})
+		if err != nil {
+			t.Fatalf("buildRequestFrame failed: %v", err)
+		}
+		// Set the outer header's MF flag (offset 0), making this the first
+		// fragment of a GENEVE packet decap would only ever see part of.
+		// decap never checks the outer IP checksum, so it isn't redone.
+		binary.BigEndian.PutUint16(badFrame[14+6:], 0x2000)
+
+		flowsBefore := flowStateCount(t)
+		beforePackets := metricSum(t, "decap_drop_malformed_packets", uint32(uplinkIface.Index))
+		if err := unix.Sendto(fd, badFrame, 0, &unix.SockaddrLinklayer{Ifindex: gwlbIface.Index}); err != nil {
+			t.Fatalf("unix.Sendto failed: %v", err)
+		}
+		if reply := waitForReply(t, fd, uplinkIface.HardwareAddr, 2*time.Second); reply != nil {
+			t.Fatalf("got a GENEVE reply for an outer first fragment, want none: %+v", reply)
+		}
+		if got := metricSum(t, "decap_drop_malformed_packets", uint32(uplinkIface.Index)); got != beforePackets+1 {
+			t.Errorf("decap_drop_malformed_packets[uplink ifindex] = %d, want %d", got, beforePackets+1)
+		}
+		if got := flowStateCount(t); got != flowsBefore {
+			t.Errorf("flow_state has %d entries after an outer fragment, want %d (nothing cached for it)", got, flowsBefore)
+		}
+	})
 }
 
 // TestOriginFiltering exercises --allowed-origin-cidr (decap.Config's
@@ -892,6 +972,29 @@ func TestNoNetns(t *testing.T) {
 	if ns, err := netns.GetFromName(vpceID); err == nil {
 		ns.Close()
 		t.Fatalf("a netns named %q exists, want none — --no-netns should never create one", vpceID)
+	}
+
+	// Both veth ends got their ENI-derived MAC (see cmd.FormatInterfaceMAC),
+	// explicitly assigned (NET_ADDR_SET, 3) rather than kernel-random
+	// (NET_ADDR_RANDOM, 1), which systemd-udevd could replace after decap
+	// cached it — see RunAdd. With --no-netns both ends are in this netns,
+	// so both show up here.
+	for _, inner := range []bool{false, true} {
+		name := cmd.FormatInterfaceName(gwlbID, inner)
+		iface, err := net.InterfaceByName(name)
+		if err != nil {
+			t.Fatalf("net.InterfaceByName(%q) failed: %v", name, err)
+		}
+		if want := cmd.FormatInterfaceMAC(gwlbID, inner); !bytes.Equal(iface.HardwareAddr, want) {
+			t.Errorf("%s MAC = %v, want %v", name, iface.HardwareAddr, want)
+		}
+		b, err := os.ReadFile("/sys/class/net/" + name + "/addr_assign_type")
+		if err != nil {
+			t.Fatalf("reading %s's addr_assign_type failed: %v", name, err)
+		}
+		if got := string(bytes.TrimSpace(b)); got != "3" {
+			t.Errorf("%s addr_assign_type = %s, want 3 (NET_ADDR_SET)", name, got)
+		}
 	}
 
 	payload := []byte("hello from gwlb-xdp e2e test (--no-netns)")
@@ -1108,7 +1211,7 @@ func TestEndToEndV6(t *testing.T) {
 // TestRemove drives one ENI through a full round trip (so its flow_state cache
 // and metrics rows are populated), then `remove`s it and checks that every
 // piece is actually reversed: the eni_to_ifindex entry, the veth pair, the
-// netns, and — the part remove exists to guarantee (see decap.RemoveENI) — the
+// netns, and — the part remove exists to guarantee (see decap.SweepENI) — the
 // flow_state and metrics entries keyed by the now-freed ifindex, so a later
 // ENI recycling that ifindex can't inherit stale cache hits or counters.
 func TestRemove(t *testing.T) {
@@ -1134,6 +1237,24 @@ func TestRemove(t *testing.T) {
 	}
 	if got := metricSum(t, "decap_ok_packets", one.outerIfindex); got == 0 {
 		t.Fatal("expected decap_ok_packets before remove")
+	}
+
+	// A few flow_state entries belonging to some other ifindex, which the
+	// sweep must leave alone.
+	const otherIfindex = 0xFFFF
+	const otherFlows = 3
+	fs, err := ebpf.LoadPinnedMap(bpf.PinDir+"/flow_state", nil)
+	if err != nil {
+		t.Fatalf("loading pinned flow_state map failed: %v", err)
+	}
+	defer fs.Close()
+	for i := range otherFlows {
+		key := make([]byte, fs.KeySize())
+		binary.NativeEndian.PutUint32(key, otherIfindex)
+		key[4] = byte(i + 1) // distinct saddr
+		if err := fs.Update(key, make([]byte, fs.ValueSize()), ebpf.UpdateAny); err != nil {
+			t.Fatalf("(*ebpf.Map).Update for flow_state failed: %v", err)
+		}
 	}
 
 	if err := cmd.RunRemove(vpceID); err != nil {
@@ -1162,12 +1283,16 @@ func TestRemove(t *testing.T) {
 		t.Errorf("netns %q still exists after remove", vpceID)
 	}
 
-	// flow_state swept — the whole point of remove's sweep (see decap.RemoveENI).
-	if n := flowStateCount(t); n != 0 {
-		t.Errorf("flow_state not swept after remove: %d entries, want 0", n)
+	// flow_state swept — the whole point of remove's sweep (see
+	// decap.SweepENI) — and nothing else's entries with it.
+	if n := flowStateCountFor(t, one.outerIfindex); n != 0 {
+		t.Errorf("flow_state not swept after remove: %d entries for the freed ifindex, want 0", n)
+	}
+	if n := flowStateCountFor(t, otherIfindex); n != otherFlows {
+		t.Errorf("flow_state has %d entries for an unrelated ifindex after remove, want %d (swept too much)", n, otherFlows)
 	}
 
-	// metrics rows for the freed ifindex swept, so a scrape stops emitting
+	// metrics rows for the freed ifindex swept, so serve stops pushing
 	// series for an interface that no longer exists.
 	if got := metricSum(t, "decap_ok_packets", one.outerIfindex); got != 0 {
 		t.Errorf("decap_ok_packets[freed ifindex] = %d after remove, want 0 (metrics not swept)", got)

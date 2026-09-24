@@ -250,9 +250,10 @@ int encap(struct xdp_md *ctx)
 	}
 
 	/* Nothing to fix up in new_eth/new_ip's addressing: decap already
-	 * swapped both the Ethernet dst/src and the IP saddr/daddr before
-	 * ever caching this header (see _decap.c), so the store above already
-	 * left them correct for the reply. Only the fields that depend on
+	 * swapped both the Ethernet dst/src and the IP saddr/daddr, and set
+	 * the reply's own TTL, ECN, DF and ID, before ever caching this header
+	 * (see _decap.c), so the store above already left them correct for
+	 * the reply. Only the fields that depend on
 	 * this specific reply's own size — computed below — still need
 	 * touching after the replay. */
 	__u16 total_len = (__u16)((__u8 *)data_end - (__u8 *)data - sizeof(struct ethhdr));

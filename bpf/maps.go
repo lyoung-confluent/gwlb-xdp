@@ -4,12 +4,12 @@
 package bpf
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
 
 	"github.com/cilium/ebpf"
+	"golang.org/x/sys/unix"
 )
 
 // PinDir is the bpffs directory holding every map and link the loader pins.
@@ -97,8 +97,7 @@ type Metric struct {
 }
 
 // Metrics reads the pinned metrics map and returns its rows grouped by counter
-// name (from CounterNames) — the shape a Prometheus scrape wants, one series
-// group per counter. A counter value beyond CounterNames (a newer program
+// name (from CounterNames). A counter value beyond CounterNames (a newer program
 // than this build knows) is skipped.
 func Metrics() (map[string][]Metric, error) {
 	path := PinDir + "/metrics"
@@ -129,35 +128,65 @@ func Metrics() (map[string][]Metric, error) {
 	return byName, nil
 }
 
+// flowKey is struct flow_key (bpf/geneve_defs.h) as the sweep sees it: the
+// leading ifindex it filters on, and the other 40 bytes left opaque. Rest
+// must be a named field: encoding/binary skips a blank (_) field when
+// decoding but writes it as zeros when encoding, which would turn every key
+// handed back to Delete into one that doesn't exist.
+type flowKey struct {
+	Ifindex uint32
+	Rest    [40]byte
+}
+
+// outerHdrCache is struct outer_hdr_cache (bpf/geneve_defs.h): 82 bytes,
+// padded to 84 by its 4-byte alignment. Only read to satisfy BatchLookup.
+type outerHdrCache [84]byte
+
+// metricKey is struct metric_key (bpf/maps.h).
+type metricKey struct {
+	Ifindex uint32
+	Counter uint32
+}
+
 // FlowStateRemove deletes every entry in the pinned flow_state map belonging
 // to ifindex — one removed ENI's cached flows, both address families in the
-// one sweep since flow_state now holds both.
+// one sweep since flow_state holds both.
 func FlowStateRemove(ifindex uint32) error {
-	return sweepByIfindex("flow_state", ifindex)
+	return sweepByIfindex[flowKey, outerHdrCache]("flow_state", ifindex, func(k flowKey) uint32 { return k.Ifindex })
 }
 
 // FragStateRemove deletes every entry in the pinned frag_state map (encap's
 // in-flight reply fragment tracking) belonging to ifindex.
 func FragStateRemove(ifindex uint32) error {
-	return sweepByIfindex("frag_state", ifindex)
+	return sweepByIfindex[flowKey, outerHdrCache]("frag_state", ifindex, func(k flowKey) uint32 { return k.Ifindex })
 }
 
 // MetricsRemove deletes every entry in the pinned metrics map belonging to
-// ifindex — one removed ENI's counter rows, so a scrape stops emitting series
+// ifindex — one removed ENI's counter rows, so serve stops pushing counters
 // for an interface that no longer exists.
 func MetricsRemove(ifindex uint32) error {
-	return sweepByIfindex("metrics", ifindex)
+	return sweepByIfindex[metricKey, uint64]("metrics", ifindex, func(k metricKey) uint32 { return k.Ifindex })
 }
 
+// sweepBatchSize is how many entries each BPF_MAP_LOOKUP_BATCH call asks for.
+// A hash map's batch lookup returns whole buckets and fails with ENOSPC if one
+// doesn't fit, in which case sweepByIfindex doubles it and retries.
+const sweepBatchSize = 4096
+
 // sweepByIfindex deletes every entry in the pinned map named mapName whose key
-// begins with ifindex — its first 4 bytes in native byte order, the leading
-// field of both struct flow_key (flow_state and frag_state's key) and struct
-// metric_key. Keys are collected
-// first, then deleted, to avoid mutating the map mid-iteration.
+// belongs to ifindex (per keyIfindex). K and V must match the map's key and
+// value layout; V is one CPU's value for a per-CPU map.
 //
-// A missing pin is tolerated (returns nil): it just means nothing has been
-// set up yet. Once the map is open, all iteration/delete errors are returned.
-func sweepByIfindex(mapName string, ifindex uint32) error {
+// It walks the map with batch lookups rather than BPF_MAP_GET_NEXT_KEY. A
+// hash map's get-next-key restarts from the first bucket whenever the key it
+// was handed has been deleted since, which a busy LRU map (flow_state) does
+// constantly as it evicts. A batch lookup's cursor is a bucket index instead,
+// so the walk finishes in one pass however much the map churns meanwhile.
+//
+// Matching keys are collected first, then deleted. A key that's already gone
+// by then (evicted, most likely) is not an error. A missing pin is tolerated
+// (returns nil): it just means nothing has been set up yet.
+func sweepByIfindex[K, V any](mapName string, ifindex uint32, keyIfindex func(K) uint32) error {
 	path := PinDir + "/" + mapName
 	m, err := ebpf.LoadPinnedMap(path, nil)
 	if err != nil {
@@ -165,27 +194,44 @@ func sweepByIfindex(mapName string, ifindex uint32) error {
 	}
 	defer m.Close()
 
-	var toDelete [][]byte
-	// nil interface means "first key" to NextKeyBytes; a typed-nil []byte
-	// would be marshalled to 0 bytes and rejected.
-	var cur interface{}
+	valuesPerKey := 1
+	if m.Type() == ebpf.PerCPUHash || m.Type() == ebpf.LRUCPUHash {
+		if valuesPerKey, err = ebpf.PossibleCPU(); err != nil {
+			return fmt.Errorf("ebpf.PossibleCPU failed: %w", err)
+		}
+	}
+
+	var toDelete []K
+	var cursor ebpf.MapBatchCursor
+	batch := sweepBatchSize
+	keys := make([]K, batch)
+	values := make([]V, batch*valuesPerKey)
 	for {
-		next, err := m.NextKeyBytes(cur)
+		n, err := m.BatchLookup(&cursor, keys, values, nil)
+		for _, k := range keys[:n] {
+			if keyIfindex(k) == ifindex {
+				toDelete = append(toDelete, k)
+			}
+		}
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			break // end of the map
+		}
+		if errors.Is(err, unix.ENOSPC) && batch < int(m.MaxEntries()) {
+			// A bucket bigger than the batch; the cursor still points at
+			// it, so retry the same bucket with room for it.
+			batch *= 2
+			keys = make([]K, batch)
+			values = make([]V, batch*valuesPerKey)
+			continue
+		}
 		if err != nil {
-			return fmt.Errorf("(*ebpf.Map).NextKeyBytes for %s failed: %w", path, err)
-		}
-		if next == nil {
-			break
-		}
-		cur = next
-		if len(next) >= 4 && binary.NativeEndian.Uint32(next[:4]) == ifindex {
-			toDelete = append(toDelete, append([]byte(nil), next...))
+			return fmt.Errorf("(*ebpf.Map).BatchLookup for %s failed: %w", path, err)
 		}
 	}
 
 	var errs []error
 	for _, k := range toDelete {
-		if err := m.Delete(k); err != nil {
+		if err := m.Delete(k); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 			errs = append(errs, fmt.Errorf("(*ebpf.Map).Delete for %s failed: %w", path, err))
 		}
 	}

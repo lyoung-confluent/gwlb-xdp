@@ -124,6 +124,13 @@ int decap(struct xdp_md *ctx)
 	if (ip->ihl != 5 || ip->protocol != IPPROTO_UDP)
 		return XDP_PASS;
 
+	/* A non-first outer fragment carries no UDP header of its own — what
+	 * sits where one would be is payload — so there's no telling here
+	 * whether it's GENEVE at all. Leave it to the kernel. */
+	__u16 outer_frag_off = bpf_ntohs(ip->frag_off);
+	if (outer_frag_off & IP_OFFSET)
+		return XDP_PASS;
+
 	struct udphdr *udp = (void *)((__u8 *)ip + (ip->ihl * 4));
 	if ((void *)(udp + 1) > data_end)
 		return XDP_PASS;
@@ -159,6 +166,16 @@ int decap(struct xdp_md *ctx)
 			increment_metric(ingress_ifindex, DECAP_CNT_DROP_ORIGIN_NOT_ALLOWED_BYTES, frame_len);
 			return XDP_DROP;
 		}
+	}
+
+	/* The first fragment of a fragmented GENEVE packet: GWLB never
+	 * fragments its outer packets, and decap only ever sees this one
+	 * piece, so the inner packet here is truncated — and caching its
+	 * outer header would replay MF onto every reply of the flow. */
+	if (outer_frag_off & IP_MF) {
+		increment_metric(ingress_ifindex, DECAP_CNT_DROP_MALFORMED_PACKETS, 1);
+		increment_metric(ingress_ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
+		return XDP_DROP;
 	}
 
 	struct gwlb_genevehdr *gnv = (void *)(udp + 1);
@@ -341,6 +358,24 @@ int decap(struct xdp_md *ctx)
 		__builtin_memcpy(daddr_bytes, ip_daddr, 4);
 		__builtin_memcpy(ip_saddr, daddr_bytes, 4);
 		__builtin_memcpy(ip_daddr, saddr_bytes, 4);
+
+		/* The reply is a new datagram from this box, so it doesn't
+		 * inherit the request's per-hop and per-packet IP fields: the
+		 * request's TTL was already decremented on the way in, its ECN
+		 * bits (CE included) describe congestion on that path rather
+		 * than the reply's, and its DF/ID belong to that one packet. Use
+		 * a fixed TTL, keep DSCP but clear ECN to Not-ECT, set DF and
+		 * zero the ID (RFC 6864: an atomic datagram's ID means nothing).
+		 * Normalizing here, before outer_hdr_stable_eq, also stops TTL or
+		 * ECN changes from forcing a flow_state rewrite. */
+		__u8 *ip_hdr = cache.hdr + sizeof(struct ethhdr);
+
+		ip_hdr[__builtin_offsetof(struct iphdr, tos)] &= ~IPTOS_ECN_MASK;
+		ip_hdr[__builtin_offsetof(struct iphdr, ttl)] = OUTER_REPLY_TTL;
+		ip_hdr[__builtin_offsetof(struct iphdr, id)] = 0;
+		ip_hdr[__builtin_offsetof(struct iphdr, id) + 1] = 0;
+		ip_hdr[__builtin_offsetof(struct iphdr, frag_off)] = IP_DF >> 8;
+		ip_hdr[__builtin_offsetof(struct iphdr, frag_off) + 1] = 0;
 	}
 
 	/* Strip everything through the GENEVE options, then reopen room for a

@@ -5,6 +5,7 @@ package encap
 import (
 	"fmt"
 	"net"
+	"os"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -128,7 +129,16 @@ func Attach(ifindex int) (_ link.Link, rerr error) {
 		}
 	}()
 
-	pinPath := fmt.Sprintf(bpf.PinDir+"/link_encap_%d", ifindex)
+	// A pin already at this path is left over from an earlier interface
+	// that had the same ifindex and is gone now (its link can't still be
+	// attached: ifindex is the caller's freshly created veth). It would make
+	// the Pin below fail, so clear it first.
+	pinPath := linkPinPath(ifindex)
+	if _, err := os.Stat(pinPath); err == nil {
+		if err := bpf.DetachXDP(pinPath); err != nil {
+			return nil, fmt.Errorf("clearing stale pin %q failed: %w", pinPath, err)
+		}
+	}
 	link, err := bpf.AttachXDP(prog, ifindex, pinPath)
 	if err != nil {
 		return nil, fmt.Errorf("bpf.AttachXDP failed: %w", err)
@@ -136,8 +146,13 @@ func Attach(ifindex int) (_ link.Link, rerr error) {
 	return link, nil
 }
 
-// Detach reverses a prior Attach for ifindex.
+// Detach reverses a prior Attach for ifindex. The error wraps os.ErrNotExist
+// if encap isn't attached (pinned) there.
 func Detach(ifindex int) error {
-	pinPath := fmt.Sprintf(bpf.PinDir+"/link_encap_%d", ifindex)
-	return bpf.DetachXDP(pinPath)
+	return bpf.DetachXDP(linkPinPath(ifindex))
+}
+
+// linkPinPath is where Attach pins encap's link on ifindex.
+func linkPinPath(ifindex int) string {
+	return fmt.Sprintf(bpf.PinDir+"/link_encap_%d", ifindex)
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	"net/netip"
 	"os"
 	"runtime"
@@ -13,7 +14,28 @@ import (
 
 	"github.com/mr-tron/base58"
 	"github.com/vishvananda/netns"
+	"golang.org/x/sys/unix"
 )
+
+// stateLockPath is the lock file withStateLock takes. It lives in /run, next
+// to the /run/netns the named netns already need.
+const stateLockPath = "/run/gwlb-xdp.lock"
+
+// withStateLock runs fn holding an exclusive lock on stateLockPath, so two
+// invocations that change state (setup, add, remove, teardown) run one after
+// the other instead of racing each other. Blocks until the lock is free.
+func withStateLock(fn func() error) error {
+	f, err := os.OpenFile(stateLockPath, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return fmt.Errorf("os.OpenFile for %q failed: %w", stateLockPath, err)
+	}
+	defer f.Close() // releases the lock
+
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX); err != nil {
+		return fmt.Errorf("unix.Flock for %q failed: %w", stateLockPath, err)
+	}
+	return fn()
+}
 
 // ParseIPv4CIDR parses cidr (as passed via --allowed-origin-cidr) into its
 // canonical network prefix (host bits zeroed), rejecting anything that isn't
@@ -80,6 +102,33 @@ func FormatInterfaceName(gwlbID uint64, inner bool) string {
 		prefix = gwlbPrefix
 	}
 	return prefix + encodeGWLBID(gwlbID)
+}
+
+// MAC address first octets, telling a veth pair's two ends apart. Both are
+// unicast (bit 0 clear) and locally administered (bit 1 set).
+const (
+	outerMACPrefix = 0x02 // veth-outer: decap/encap side
+	innerMACPrefix = 0x06 // veth-inner: backend/appliance side
+)
+
+// FormatInterfaceMAC returns the MAC address of one end of gwlbID's veth
+// pair (inner selects which, as for FormatInterfaceName): the end's prefix
+// octet, then the low 40 bits of gwlbID. That puts the last 10 hex digits of
+// the VPC endpoint ID right in the address, so vpce-0123456789abcdef0's ends
+// are 02:78:9a:bc:de:f0 (outer) and 06:78:9a:bc:de:f0 (inner), and it stays
+// the same across remove and re-add.
+//
+// Two ENIs whose IDs share those 40 bits get the same MACs, which is
+// harmless: each veth pair is a separate two-node link, and even in
+// --no-netns mode neighbor tables are per interface.
+func FormatInterfaceMAC(gwlbID uint64, inner bool) net.HardwareAddr {
+	prefix := byte(outerMACPrefix)
+	if inner {
+		prefix = innerMACPrefix
+	}
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], gwlbID)
+	return net.HardwareAddr{prefix, buf[3], buf[4], buf[5], buf[6], buf[7]}
 }
 
 func encodeGWLBID(gwlbID uint64) string {

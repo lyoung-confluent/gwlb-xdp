@@ -19,7 +19,7 @@ var RemoveCmd = &cobra.Command{
 	Short: `Reverse "add"`,
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return RunRemove(args[0])
+		return withStateLock(func() error { return RunRemove(args[0]) })
 	},
 }
 
@@ -31,6 +31,11 @@ func init() {
 // the outer veth is found by ifindex (from the BPF map, when present) or by
 // its name, which — unlike the netns it and its peer end up in — doesn't
 // depend on the mode.
+//
+// Teardown runs in the order that lets nothing repopulate what the ENI
+// cached: stop decap delivering to it, detach encap, delete the veth, and
+// only then sweep its flow_state/frag_state/metrics entries (see
+// decap.SweepENI).
 func RunRemove(vpceID string) error {
 	gwlbID, err := ParseVPCEID(vpceID)
 	if err != nil {
@@ -39,35 +44,42 @@ func RunRemove(vpceID string) error {
 	// The netns was named after the canonical spelling (see RunAdd).
 	vpceID = FormatVPCEID(gwlbID)
 
-	// A non-zero Ifindex means the entry was deleted even if the error is set
-	// (see RemoveENI), so that — not the error — gates detaching encap and
-	// finding the veth by ifindex below.
-	info, removeErr := decap.RemoveENI(gwlbID)
-	errs := []error{removeErr}
-	if info.Ifindex != 0 {
-		if err := encap.Detach(int(info.Ifindex)); err != nil {
-			errs = append(errs, fmt.Errorf("encap.Detach for ifindex %d failed: %w", info.Ifindex, err))
+	var errs []error
+	info, err := decap.RemoveENI(gwlbID)
+	if err != nil {
+		errs = append(errs, err)
+	}
+
+	// No map entry to read an ifindex from (e.g. a repeated remove, or an
+	// add that failed partway) — fall back to the outer end's name (the same
+	// regardless of --no-netns), so a leftover veth and encap pin still get
+	// cleaned up.
+	ifindex := int(info.Ifindex)
+	fromMap := ifindex != 0
+	if !fromMap {
+		if link, err := netlink.LinkByName(FormatInterfaceName(gwlbID, false)); err == nil {
+			ifindex = link.Attrs().Index
+		}
+	}
+
+	if ifindex != 0 {
+		// Without a map entry, encap may never have been attached at all.
+		if err := encap.Detach(ifindex); err != nil && (fromMap || !errors.Is(err, os.ErrNotExist)) {
+			errs = append(errs, fmt.Errorf("encap.Detach for ifindex %d failed: %w", ifindex, err))
 		}
 
 		// Deleting the outer end removes its peer too (veth ends are linked
 		// by ifindex) — regardless of whether that peer sits in a netns or
-		// alongside it in the root netns. Best-effort: a missing link just
-		// means nothing to clean up.
-		if link, err := netlink.LinkByIndex(int(info.Ifindex)); err == nil {
+		// alongside it in the root netns. A missing link just means nothing
+		// to clean up.
+		if link, err := netlink.LinkByIndex(ifindex); err == nil {
 			if err := netlink.LinkDel(link); err != nil {
-				errs = append(errs, fmt.Errorf("netlink.LinkDel for ifindex %d failed: %w", info.Ifindex, err))
+				errs = append(errs, fmt.Errorf("netlink.LinkDel for ifindex %d failed: %w", ifindex, err))
 			}
 		}
-	} else {
-		// No map entry to read an ifindex from (e.g. a repeated remove, or
-		// the ENI was never provisioned) — fall back to the outer end's name
-		// (the same regardless of --no-netns) so any leftover veth still gets
-		// cleaned up.
-		ifname := FormatInterfaceName(gwlbID, false)
-		if link, err := netlink.LinkByName(ifname); err == nil {
-			if err := netlink.LinkDel(link); err != nil {
-				errs = append(errs, fmt.Errorf("netlink.LinkDel for %q failed: %w", ifname, err))
-			}
+
+		if err := decap.SweepENI(uint32(ifindex)); err != nil {
+			errs = append(errs, fmt.Errorf("decap.SweepENI for ifindex %d failed: %w", ifindex, err))
 		}
 	}
 

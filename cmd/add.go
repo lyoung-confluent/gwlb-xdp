@@ -3,7 +3,6 @@ package cmd
 import (
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"os/exec"
 
@@ -30,7 +29,7 @@ var AddCmd = &cobra.Command{
 	Short: "Provision one ENI on the fly",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return RunAdd(args[0], ScriptPath, !NoNetns)
+		return withStateLock(func() error { return RunAdd(args[0], ScriptPath, !NoNetns) })
 	},
 }
 
@@ -71,6 +70,56 @@ func RunAdd(vpceID string, scriptPath string, isolated bool) (err error) {
 		return err
 	}
 
+	// Refuse an ENI that's already provisioned before touching anything, so
+	// a repeated or retried add fails cleanly and leaves the live one alone.
+	if _, err := decap.LookupENI(gwlbID); err == nil {
+		return fmt.Errorf("%s is already provisioned (remove it first)", vpceID)
+	} else if !errors.Is(err, ebpf.ErrKeyNotExist) {
+		return fmt.Errorf("decap.LookupENI for %q failed: %w", vpceID, err)
+	}
+
+	// Roll back partial state on any error — but only what this call itself
+	// created, tracked by the flags below. Anything that already existed
+	// (a veth or netns by the same name, say) belongs to someone else and is
+	// left alone. Cleanup failures are joined onto err so a leaked
+	// veth/netns doesn't vanish silently.
+	var (
+		createdNetns bool
+		outerIfindex int // set once this call has created the veth pair
+		insertedENI  bool
+	)
+	defer func() {
+		if err == nil {
+			return
+		}
+		// First stop decap delivering to the ENI, then delete the veth
+		// (which also removes its peer, wherever it is, and detaches
+		// encap), and only then sweep what the ENI cached — see
+		// decap.SweepENI for why that order matters.
+		if insertedENI {
+			if _, e := decap.RemoveENI(gwlbID); e != nil {
+				err = errors.Join(err, fmt.Errorf("rollback: decap.RemoveENI for %q failed: %w", vpceID, e))
+			}
+		}
+		if outerIfindex != 0 {
+			if link, e := netlink.LinkByIndex(outerIfindex); e == nil {
+				if e := netlink.LinkDel(link); e != nil {
+					err = errors.Join(err, fmt.Errorf("rollback: netlink.LinkDel for %q failed: %w", outerName, e))
+				}
+			}
+		}
+		if insertedENI {
+			if e := decap.SweepENI(uint32(outerIfindex)); e != nil {
+				err = errors.Join(err, fmt.Errorf("rollback: decap.SweepENI for %q failed: %w", outerName, e))
+			}
+		}
+		if createdNetns {
+			if e := netns.DeleteNamed(vpceID); e != nil && !errors.Is(e, os.ErrNotExist) {
+				err = errors.Join(err, fmt.Errorf("rollback: netns.DeleteNamed for %q failed: %w", vpceID, e))
+			}
+		}
+	}()
+
 	var newns netns.NsHandle
 	var nsh *netlink.Handle
 	if isolated {
@@ -78,6 +127,7 @@ func RunAdd(vpceID string, scriptPath string, isolated bool) (err error) {
 		if err != nil {
 			return fmt.Errorf("CreateNamedNetns for %q failed: %w", vpceID, err)
 		}
+		createdNetns = true
 		defer newns.Close()
 
 		nsh, err = netlink.NewHandleAt(newns)
@@ -89,38 +139,6 @@ func RunAdd(vpceID string, scriptPath string, isolated bool) (err error) {
 	}
 	defer nsh.Close()
 
-	// Roll back partial state on any error. Deleting the outer end also
-	// removes its peer (veth ends are linked by ifindex), so this cleans up
-	// no matter how far below we fail. Cleanup failures are joined onto err
-	// so a leaked veth/netns doesn't vanish silently.
-	defer func() {
-		if err != nil {
-			// If AddENI already ran (it's the second-to-last step), its
-			// eni_to_ifindex entry would otherwise outlive the veth we're
-			// about to delete — leaving decap redirecting this ENI's traffic
-			// to a dead (and eventually recycled) ifindex, and blocking any
-			// re-add since AddENI refuses to overwrite. Sweep it too. A
-			// not-yet-inserted entry just isn't found (ErrKeyNotExist), and a
-			// failure so early that setup's map pin doesn't exist yet
-			// (os.ErrNotExist) likewise means there's nothing to undo — neither
-			// is a rollback failure.
-			if _, e := decap.RemoveENI(gwlbID); e != nil &&
-				!errors.Is(e, ebpf.ErrKeyNotExist) && !errors.Is(e, os.ErrNotExist) {
-				err = errors.Join(err, fmt.Errorf("rollback: decap.RemoveENI for %q failed: %w", vpceID, e))
-			}
-			if link, e := netlink.LinkByName(outerName); e == nil {
-				if e := netlink.LinkDel(link); e != nil {
-					err = errors.Join(err, fmt.Errorf("rollback: netlink.LinkDel for %q failed: %w", outerName, e))
-				}
-			}
-			if isolated {
-				if e := netns.DeleteNamed(vpceID); e != nil && !errors.Is(e, os.ErrNotExist) {
-					err = errors.Join(err, fmt.Errorf("rollback: netns.DeleteNamed for %q failed: %w", vpceID, e))
-				}
-			}
-		}
-	}()
-
 	// MTU vethMTU: the uplink's MTU minus GENEVE's 68 bytes, the largest
 	// inner packet decap delivers and encap sends (see bpf.MaxInnerLen). It
 	// has to be that large: veth drops a frame over the receiving end's MTU,
@@ -128,17 +146,36 @@ func RunAdd(vpceID string, scriptPath string, isolated bool) (err error) {
 	// replies to GWLB's documented 8500 with a route MTU instead (see
 	// README.md) — the interface MTU governs what it can receive.
 	//
+	// Both ends get MACs derived from the ENI ID (see FormatInterfaceMAC)
+	// rather than the kernel's random ones, so they're recognizable and the
+	// same every time this ENI is added. Being explicitly assigned also
+	// keeps systemd-udevd off them: its default MACAddressPolicy=persistent
+	// replaces a kernel-random MAC asynchronously after the device appears
+	// — possibly after decap has cached the old one below — but leaves an
+	// assigned one alone.
+	//
 	// Both ends already have their final, distinct names (outer and inner
 	// never collide, isolated or not), so they're created in place in the
 	// root netns with no rename needed — isolated just additionally migrates
 	// the inner end into its dedicated netns afterwards.
 	if err := netlink.LinkAdd(&netlink.Veth{
-		LinkAttrs: netlink.LinkAttrs{Name: outerName, MTU: vethMTU},
-		PeerName:  innerName,
-		PeerMTU:   uint32(vethMTU),
+		LinkAttrs:        netlink.LinkAttrs{Name: outerName, MTU: vethMTU, HardwareAddr: FormatInterfaceMAC(gwlbID, false)},
+		PeerName:         innerName,
+		PeerMTU:          uint32(vethMTU),
+		PeerHardwareAddr: FormatInterfaceMAC(gwlbID, true),
 	}); err != nil {
 		return fmt.Errorf("netlink.LinkAdd for veth pair %s/%s failed: %w", outerName, innerName, err)
 	}
+	outer, err := netlink.LinkByName(outerName)
+	if err != nil {
+		// Just created, so this can't normally fail. If it does, the veth
+		// can't be rolled back by ifindex, so do it by name instead.
+		if link, e := netlink.LinkByName(outerName); e == nil {
+			_ = netlink.LinkDel(link)
+		}
+		return fmt.Errorf("netlink.LinkByName for %q failed: %w", outerName, err)
+	}
+	outerIfindex = outer.Attrs().Index
 
 	if isolated {
 		peer, err := netlink.LinkByName(innerName)
@@ -156,10 +193,6 @@ func RunAdd(vpceID string, scriptPath string, isolated bool) (err error) {
 	}
 
 	// Bring up both the inner/outer interfaces.
-	outer, err := netlink.LinkByName(outerName)
-	if err != nil {
-		return fmt.Errorf("netlink.LinkByName for %q failed: %w", outerName, err)
-	}
 	if err := netlink.LinkSetUp(outer); err != nil {
 		return fmt.Errorf("netlink.LinkSetUp for %q failed: %w", outerName, err)
 	}
@@ -180,11 +213,6 @@ func RunAdd(vpceID string, scriptPath string, isolated bool) (err error) {
 		return err
 	}
 
-	mac := inner.Attrs().HardwareAddr
-	if len(mac) == 0 {
-		return fmt.Errorf("inner interface %s has no hardware address", innerName)
-	}
-
 	// Last chance to finish backend setup before this ENI is wired up and
 	// reachable below (see the --script flag).
 	if scriptPath != "" {
@@ -197,18 +225,31 @@ func RunAdd(vpceID string, scriptPath string, isolated bool) (err error) {
 		}
 	}
 
+	// Read both ends' MACs only now, after --script: the script is where the
+	// netns's interface gets configured, and it may well set the inner
+	// end's address itself. decap writes the inner MAC into every frame it
+	// delivers, and the netns drops any frame not addressed to it.
+	inner, err = nsh.LinkByName(innerName)
+	if err != nil {
+		return fmt.Errorf("(*netlink.Handle).LinkByName for %q failed: %w", innerName, err)
+	}
+	innerMAC := inner.Attrs().HardwareAddr
+	if len(innerMAC) == 0 {
+		return fmt.Errorf("inner interface %s has no hardware address", innerName)
+	}
+	outer, err = netlink.LinkByIndex(outerIfindex)
+	if err != nil {
+		return fmt.Errorf("netlink.LinkByIndex for %q failed: %w", outerName, err)
+	}
+
 	// Insert into eni_to_ifindex and attach encap — this makes the ENI
 	// reachable, so it happens last.
-	outerIface, err := net.InterfaceByName(outerName)
-	if err != nil {
-		return fmt.Errorf("net.InterfaceByName for %q failed: %w", outerName, err)
-	}
-
-	if err := decap.AddENI(gwlbID, uint32(outerIface.Index), mac, outerIface.HardwareAddr); err != nil {
+	if err := decap.AddENI(gwlbID, uint32(outerIfindex), innerMAC, outer.Attrs().HardwareAddr); err != nil {
 		return fmt.Errorf("decap.AddENI for %q failed: %w", outerName, err)
 	}
+	insertedENI = true
 
-	if _, err := encap.Attach(outerIface.Index); err != nil {
+	if _, err := encap.Attach(outerIfindex); err != nil {
 		return fmt.Errorf("encap.Attach for %q failed: %w", outerName, err)
 	}
 

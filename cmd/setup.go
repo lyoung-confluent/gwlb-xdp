@@ -26,7 +26,9 @@ var SetupCmd = &cobra.Command{
 	Short: "Load and attach the XDP pipeline to the physical interface",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return RunSetup(args[0], MaxENIs, MaxFlows, Transparent, AllowedOriginCIDR)
+		return withStateLock(func() error {
+			return RunSetup(args[0], MaxENIs, MaxFlows, Transparent, AllowedOriginCIDR)
+		})
 	},
 }
 
@@ -36,7 +38,13 @@ func init() {
 	SetupCmd.Flags().Uint32Var(&MaxENIs, "max-enis", MaxENIs, "max concurrent ENIs this box can serve (sizes eni_to_ifindex)")
 	SetupCmd.Flags().Uint32Var(&MaxFlows, "max-flows", MaxFlows, "max concurrent flows tracked, IPv4 and IPv6 combined (sizes the shared flow_state map)")
 	SetupCmd.Flags().BoolVar(&Transparent, "transparent", Transparent, "hardcode every ENI on this box as a transparent appliance (reply comes back with the same 5-tuple, not swapped)")
-	SetupCmd.Flags().StringVar(&AllowedOriginCIDR, "allowed-origin-cidr", "", "restrict accepted GENEVE traffic to this outer source IPv4 CIDR (any other origin is dropped); if unset, every origin is accepted")
+	SetupCmd.Flags().StringVar(&AllowedOriginCIDR, "allowed-origin-cidr", "", "accept GENEVE traffic only from this outer source IPv4 CIDR — the GWLB's subnet(s) — and drop any other origin; pass 0.0.0.0/0 to accept every origin")
+	// Required, with 0.0.0.0/0 as the explicit opt-out: anyone else who can
+	// reach UDP 6081 could otherwise inject packets into an ENI's netns, or
+	// overwrite a flow's cached outer header and redirect its replies.
+	if err := SetupCmd.MarkFlagRequired("allowed-origin-cidr"); err != nil {
+		panic(err)
+	}
 }
 
 func RunSetup(intfName string, maxENIs, maxFlows uint32, transparent bool, allowedOriginCIDR string) (err error) {

@@ -1,6 +1,6 @@
 # ---- dev: full BPF/netns toolchain the Makefile drives for `generate` and `verify`
 FROM cgr.dev/chainguard/go:latest-dev AS dev
-RUN apk add --no-cache clang llvm libbpf-dev bpftool mount
+RUN apk add --no-cache clang llvm libbpf-dev bpftool mount iproute2
 WORKDIR /work
 ENTRYPOINT []
 

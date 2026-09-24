@@ -17,7 +17,7 @@ var TeardownCmd = &cobra.Command{
 	Short: `Reverse "setup"`,
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return RunTeardown()
+		return withStateLock(RunTeardown)
 	},
 }
 

@@ -198,9 +198,16 @@ func buildRequestFrame(p requestParams) ([]byte, error) {
 		DstMAC:       p.outerDstMAC,
 		EthernetType: layers.EthernetTypeIPv4,
 	}
+	// The outer IP fields decap rewrites before caching (see _decap.c) are
+	// all set to something other than what a reply should carry — a TTL
+	// already decremented in transit, a CE mark, no DF, a nonzero ID — so
+	// assertValidReply can tell the rewrite happened rather than the
+	// request's values being replayed.
 	outerIP := &layers.IPv4{
 		Version:  4,
-		TTL:      64,
+		TTL:      requestOuterTTL,
+		TOS:      requestOuterTOS,
+		Id:       requestOuterID,
 		Protocol: layers.IPProtocolUDP,
 		SrcIP:    p.outerSrcIP,
 		DstIP:    p.outerDstIP,
@@ -220,6 +227,15 @@ func buildRequestFrame(p requestParams) ([]byte, error) {
 	return append([]byte(nil), outerBuf.Bytes()...), nil
 }
 
+// The outer IP header fields buildRequestFrame sends: TTL as if already
+// decremented in transit, TOS with DSCP EF (46) plus an ECN CE mark, a nonzero
+// ID, and (implicitly) no DF.
+const (
+	requestOuterTTL = 61
+	requestOuterTOS = 46<<2 | 0x03
+	requestOuterID  = 0x1234
+)
+
 // replyPacket is what parseReply extracts from a captured frame. Despite
 // the name, sendGENEVE also uses it to read back a just-built *request*
 // frame — the wire shape is identical either way (outer eth/ip/udp/geneve
@@ -232,6 +248,13 @@ type replyPacket struct {
 	outerDstPort             uint16
 	outerUDPChecksum         uint16 // encap zeroes this on a reply — see _encap.c
 	outerIPChecksumValid     bool   // encap recomputes this on a reply — see ipv4_checksum in _encap.c
+
+	// Set by decap for every reply rather than copied from the request —
+	// see the TTL/ECN/DF/ID rewrite in _decap.c.
+	outerTTL   uint8
+	outerTOS   uint8
+	outerFlags layers.IPv4Flag
+	outerID    uint16
 
 	opts []byte // raw GENEVE option bytes — see the type comment and parseReply
 
@@ -318,6 +341,11 @@ func parseReply(frame []byte) (*replyPacket, error) {
 		outerDstPort:         uint16(outerUDP.DstPort),
 		outerUDPChecksum:     outerUDP.Checksum,
 		outerIPChecksumValid: verifyIPChecksum(outerIP.Contents),
+
+		outerTTL:   outerIP.TTL,
+		outerTOS:   outerIP.TOS,
+		outerFlags: outerIP.Flags,
+		outerID:    outerIP.Id,
 
 		opts: opts,
 

@@ -42,3 +42,24 @@ func TestParseVPCEID(t *testing.T) {
 		}
 	}
 }
+
+func TestFormatInterfaceMAC(t *testing.T) {
+	for _, tc := range []struct {
+		vpceID       string
+		outer, inner string
+	}{
+		{"vpce-0123456789abcdef0", "02:78:9a:bc:de:f0", "06:78:9a:bc:de:f0"},
+		{"vpce-1a2b3c4d", "02:00:1a:2b:3c:4d", "06:00:1a:2b:3c:4d"},
+	} {
+		gwlbID, err := ParseVPCEID(tc.vpceID)
+		if err != nil {
+			t.Fatalf("ParseVPCEID(%q) failed: %v", tc.vpceID, err)
+		}
+		if got := FormatInterfaceMAC(gwlbID, false).String(); got != tc.outer {
+			t.Errorf("FormatInterfaceMAC(%s, outer) = %s, want %s", tc.vpceID, got, tc.outer)
+		}
+		if got := FormatInterfaceMAC(gwlbID, true).String(); got != tc.inner {
+			t.Errorf("FormatInterfaceMAC(%s, inner) = %s, want %s", tc.vpceID, got, tc.inner)
+		}
+	}
+}

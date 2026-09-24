@@ -15,7 +15,7 @@ import (
 	"github.com/lyoung-confluent/gwlb-xdp/bpf"
 )
 
-// EniInfo is eni_to_ifindex's map value (bpf/maps.h: struct eni_info).
+// EniInfo is eni_to_ifindex's map value (struct eni_info in _decap.c).
 type EniInfo = bpfEniInfo
 
 // PinLink is where Attach pins decap's XDP attachment, and teardown checks
@@ -182,17 +182,10 @@ func AddENI(gwlbID uint64, ifindex uint32, dstMac, srcMac net.HardwareAddr) erro
 	return nil
 }
 
-// RemoveENI deletes gwlbID's entry from eni_to_ifindex and sweeps its
-// flow_state/frag_state cache entries and metrics rows by ifindex (a recycled veth
-// ifindex could otherwise match stale flow entries before the LRU ages them
-// out, and stale metrics would keep being scraped). It returns the entry as it
-// stood before deletion, so the caller can detach anything keyed on its
-// ifindex (e.g. encap).
-//
-// A non-nil error doesn't mean the entry survived: a non-zero EniInfo with
-// an error means the entry was deleted and only the sweep failed. Check
-// EniInfo.Ifindex, not just the error, before treating removal as failed.
-func RemoveENI(gwlbID uint64) (EniInfo, error) {
+// LookupENI returns gwlbID's eni_to_ifindex entry. The error wraps
+// ebpf.ErrKeyNotExist if the ENI isn't provisioned, or os.ErrNotExist if
+// setup hasn't pinned the map yet.
+func LookupENI(gwlbID uint64) (EniInfo, error) {
 	path := bpf.PinDir + "/" + bpfMapEniToIfindex
 	m, err := ebpf.LoadPinnedMap(path, nil)
 	if err != nil {
@@ -204,14 +197,47 @@ func RemoveENI(gwlbID uint64) (EniInfo, error) {
 	if err := m.Lookup(&gwlbID, &info); err != nil {
 		return EniInfo{}, fmt.Errorf("(*ebpf.Map).Lookup for %s failed: %w", bpfMapEniToIfindex, err)
 	}
+	return info, nil
+}
+
+// RemoveENI deletes gwlbID's entry from eni_to_ifindex, so decap stops
+// delivering to it, and returns the entry as it stood before deletion so the
+// caller can tear down everything keyed on its ifindex (encap, the veth) and
+// then call SweepENI. The error wraps ebpf.ErrKeyNotExist if the ENI isn't
+// provisioned, or os.ErrNotExist if setup hasn't pinned the map yet.
+func RemoveENI(gwlbID uint64) (EniInfo, error) {
+	path := bpf.PinDir + "/" + bpfMapEniToIfindex
+	m, err := ebpf.LoadPinnedMap(path, nil)
+	if err != nil {
+		return EniInfo{}, fmt.Errorf("ebpf.LoadPinnedMap for %q failed: %w", path, err)
+	}
+	defer m.Close()
+
+	// Lookup then Delete rather than LookupAndDelete, which hash maps only
+	// support from Linux 5.14.
+	var info EniInfo
+	if err := m.Lookup(&gwlbID, &info); err != nil {
+		return EniInfo{}, fmt.Errorf("(*ebpf.Map).Lookup for %s failed: %w", bpfMapEniToIfindex, err)
+	}
 	if err := m.Delete(&gwlbID); err != nil {
 		return EniInfo{}, fmt.Errorf("(*ebpf.Map).Delete for %s failed: %w", bpfMapEniToIfindex, err)
 	}
+	return info, nil
+}
 
-	sweepErr := errors.Join(
-		bpf.FlowStateRemove(info.Ifindex),
-		bpf.FragStateRemove(info.Ifindex),
-		bpf.MetricsRemove(info.Ifindex),
+// SweepENI deletes every flow_state/frag_state entry and metrics row keyed by
+// a removed ENI's veth-outer ifindex, so a later ENI that reuses the ifindex
+// can't inherit stale cache hits or counters.
+//
+// Call it only once nothing can still write those keys: after RemoveENI, and
+// after the veth itself is deleted. Deleting the veth detaches encap and
+// waits out an RCU grace period, so by then every decap or encap run that
+// might still have been using that ifindex has finished. Sweeping any
+// earlier lets those in-flight runs put entries back.
+func SweepENI(ifindex uint32) error {
+	return errors.Join(
+		bpf.FlowStateRemove(ifindex),
+		bpf.FragStateRemove(ifindex),
+		bpf.MetricsRemove(ifindex),
 	)
-	return info, sweepErr
 }
