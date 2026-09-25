@@ -58,16 +58,11 @@ VPC endpoint IDs can be in AWS's current 17-hex-digit form (`vpce-0123456789abcd
 | `serve` | `--statsd` | `127.0.0.1:8125` | statsd endpoint for counters (typically the local CloudWatch agent). |
 | `serve` | `--interval` | `0` | How often to push counters to statsd. `0` disables pushing. |
 
-`--allowed-origin-cidr` is required so that accepting all traffic is an explicit choice. Without it, anyone who can reach UDP 6081 could inject packets into an endpoint's netns or hijack a flow's replies.
+`--allowed-origin-cidr` is required so that accepting all traffic is an explicit choice. Without it, anyone who can reach UDP 6081 could inject packets into an endpoint's netns or hijack a flow's replies. If AWS security groups already restrict who can reach UDP 6081 on this host, you can set it to `0.0.0.0/0` and let the security group do the filtering.
 
 ### Configuring the backend netns
 
-`add` creates the netns and veth but leaves addressing and routing to your `--script`. Besides the usual addresses and routes, the script needs to set two things:
-
-1. **A route MTU of 8500.** GWLB silently drops replies larger than 8500 bytes and never sends ICMP "fragmentation needed". The veth's own MTU is larger than that (see [MTU details](#mtu-and-offloads)), so set the limit on the routes.
-2. **A permanent neighbor entry for the next hop.** encap replaces the reply's Ethernet header, so the MAC doesn't matter, but the kernel won't send a reply until the next hop resolves. ARP and Neighbor Discovery from the netns only get answers for addresses the root netns owns, so pin an entry with any unicast MAC.
-
-For example:
+`add` creates the netns and veth but leaves addressing and routing to your `--script`. Besides the usual addresses and routes, the script needs to set **a route MTU of 8500**. GWLB silently drops replies larger than 8500 bytes and never sends ICMP "fragmentation needed". The veth's own MTU is larger than that (see [MTU details](#mtu-and-offloads)), so set the limit on the routes. For example:
 
 ```sh
 #!/bin/sh
@@ -75,10 +70,9 @@ For example:
 ip -n "$1" addr add 10.0.0.2/24 dev "$2"
 ip -n "$1" route change 10.0.0.0/24 dev "$2" mtu 8500
 ip -n "$1" route add default via 10.0.0.1 dev "$2" mtu 8500
-ip -n "$1" neigh replace 10.0.0.1 lladdr 02:00:00:00:00:01 dev "$2" nud permanent
 ```
 
-Every destination the netns reaches directly (on-link, with no `via`) needs its own neighbor entry too, so route replies through a single next hop where you can. The e2e test does this for its fake client (see `provisionENI` in [test/e2e/e2e_test.go](test/e2e/e2e_test.go)).
+You don't need neighbor entries for the next hop. `add` turns ARP/ND off on the inner veth end (`IFF_NOARP`), so the netns sends replies right away without resolving anything. Scripts that still pin neighbor entries keep working.
 
 ### Health and metrics
 
@@ -105,7 +99,7 @@ The [Dockerfile](Dockerfile) has three stages:
 
 ### End-to-end tests
 
-[test/e2e](test/e2e) tests decap and encap together without a real GWLB. It builds synthetic GWLB GENEVE packets, sends them into a veth pair standing in for the uplink, runs them through the real `setup`/`add` netns and veths to a UDP echo server, and checks the GENEVE reply that comes back. Other tests cover ICMP echo, ICMP errors, fragmented replies, Neighbor Discovery, oversize drops, and TCP segmentation ([datapath_test.go](test/e2e/datapath_test.go)).
+[test/e2e](test/e2e) tests decap and encap together without a real GWLB. It builds synthetic GWLB GENEVE packets, sends them into a veth pair standing in for the uplink, runs them through the real `setup`/`add` netns and veths to a UDP echo server, and checks the GENEVE reply that comes back. Other tests cover ICMP echo, ICMP errors, fragmented replies, Neighbor Discovery, sending without neighbor resolution, oversize drops, and TCP segmentation ([datapath_test.go](test/e2e/datapath_test.go)).
 
 The tests need real netns, veth and XDP support (`CAP_NET_ADMIN`, `CAP_SYS_ADMIN`, `CAP_BPF`), so run them in the privileged dev container:
 
@@ -157,7 +151,7 @@ Some replies can't be matched by their own 5-tuple:
 
 - **ICMP and ICMPv6 errors** from the backend (port unreachable, time exceeded, packet too big, parameter problem) are matched using the packet they quote, which is the one decap delivered. They go back with that flow's GENEVE options, flow cookie included.
 - **Fragments.** A datagram's first fragment is matched normally and recorded in `frag_state`. Later fragments have no L4 header, so they're matched through that record.
-- **IPv6 Neighbor Discovery and MLD** (ICMPv6 types 130–143) between the netns and its veth are passed to the kernel, like ARP, instead of being looked up.
+- **IPv6 Neighbor Discovery and MLD** (ICMPv6 types 130–143) between the netns and its veth are passed to the kernel, like ARP, instead of being looked up. Since `add` turns ARP/ND off on the inner end, in practice this is mostly MLD, unless `--script` turns ARP back on.
 
 A reply too large to leave the uplink once encapsulated (larger than `max_inner_len`) is dropped and counted as oversize, rather than being redirected into a silent drop.
 
@@ -170,9 +164,10 @@ A reply too large to leave the uplink once encapsulated (larger than `max_inner_
    - Names come from the ENI ID (`FormatInterfaceName` in [cmd/utils.go](cmd/utils.go)): `gxdp<id>` for the outer end and `gwlb<id>` for the inner end.
    - MTU is the uplink's MTU minus GENEVE's 68 bytes (8933 on a 9001-byte uplink). That's the largest inner packet decap can deliver, and veth drops frames over the receiving end's MTU.
    - MACs are derived from the endpoint ID instead of being random (`FormatInterfaceMAC` in [cmd/utils.go](cmd/utils.go)): `02` for the outer end or `06` for the inner end, followed by the last 10 hex digits of the ID. For `vpce-0123456789abcdef0`, the inner end is `06:78:9a:bc:de:f0`. This makes them easy to spot in captures and stable across `remove`/`add`. Setting them explicitly also stops systemd-udevd's default `MACAddressPolicy=persistent` from replacing a random MAC after `add` has recorded it.
-3. **Disable offloads** on both ends: TX checksum offload and every segmentation and GRO offload (TSO, GSO, USO, GRO and so on; see `vethDisabledFeatures` in [cmd/add.go](cmd/add.go)). BPF can't compute the real L4 checksum, so the kernel has to write it before encap sees the packet. Every packet crossing the veth also has to be wire-sized, because encap would turn a GSO super-packet into one oversized frame that gets dropped.
-4. **Run `--script`**, if given, so the backend can finish its setup before the endpoint is reachable.
-5. **Go live.** Read both ends' MACs (only now, since the script may have changed the inner one), insert `ENI ID → (outer ifindex, inner MAC, outer MAC)` into `eni_to_ifindex`, and attach encap to the outer end. This is last because it's what makes the endpoint reachable.
+3. **Turn ARP/ND off on the inner end** (`IFF_NOARP`). encap replaces the reply's whole Ethernet header, so the destination MAC the netns picks never reaches the wire. With ARP on, though, the netns's kernel would hold every reply until it resolved the next hop, and nothing would answer, because the root netns only answers for its own addresses. With ARP off, the kernel sends right away to the interface's own MAC, whatever the routes look like. Nothing needs to resolve the inner end either, since decap addresses every frame it delivers directly.
+4. **Disable offloads** on both ends: TX checksum offload and every segmentation and GRO offload (TSO, GSO, USO, GRO and so on; see `vethDisabledFeatures` in [cmd/add.go](cmd/add.go)). BPF can't compute the real L4 checksum, so the kernel has to write it before encap sees the packet. Every packet crossing the veth also has to be wire-sized, because encap would turn a GSO super-packet into one oversized frame that gets dropped.
+5. **Run `--script`**, if given, so the backend can finish its setup before the endpoint is reachable.
+6. **Go live.** Read both ends' MACs (only now, since the script may have changed the inner one), insert `ENI ID → (outer ifindex, inner MAC, outer MAC)` into `eni_to_ifindex`, and attach encap to the outer end. This is last because it's what makes the endpoint reachable.
 
 With `--no-netns`, step 1 is skipped and the inner end stays in the root netns with the same name. Nothing then keeps different endpoints' routing tables apart, which is why a dedicated netns is the default.
 

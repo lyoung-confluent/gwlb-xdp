@@ -115,7 +115,7 @@ func TestICMPErrorReply(t *testing.T) {
 
 	uplinkIface, gwlbIface := setupUplink(t)
 	runSetup(t, 8)
-	one := provisionENI(t, gwlbID, true, echoServerPort, fakeClientMAC, bytes.Clone)
+	one := provisionENI(t, gwlbID, true, echoServerPort, bytes.Clone)
 	fd := openGWLBSocket(t, gwlbIface)
 
 	cases := []struct {
@@ -216,11 +216,97 @@ func TestICMPErrorReply(t *testing.T) {
 	}
 }
 
+// watchVethOuter returns a packet socket on veth-outer in the root netns,
+// which only sees what encap passed to the stack.
+func watchVethOuter(t *testing.T, outerIfindex uint32) int {
+	t.Helper()
+	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(unix.ETH_P_ALL)))
+	if err != nil {
+		t.Fatalf("unix.Socket failed: %v", err)
+	}
+	t.Cleanup(func() { unix.Close(fd) })
+	if err := unix.Bind(fd, &unix.SockaddrLinklayer{Protocol: htons(unix.ETH_P_ALL), Ifindex: int(outerIfindex)}); err != nil {
+		t.Fatalf("unix.Bind failed: %v", err)
+	}
+	return fd
+}
+
+// sendFromENINetns sends one UDP datagram to dst from inside gwlbID's netns.
+func sendFromENINetns(t *testing.T, gwlbID uint64, dst string) {
+	t.Helper()
+	inENINetns(t, gwlbID, func() error {
+		conn, err := net.DialUDP("udp6", nil, &net.UDPAddr{IP: net.ParseIP(dst), Port: 9})
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+		_, err = conn.Write([]byte("resolve me"))
+		return err
+	})
+}
+
+// sawNeighborSolicit reports whether a Neighbor Solicitation for target
+// turns up on fd within timeout.
+func sawNeighborSolicit(t *testing.T, fd int, target string, timeout time.Duration) bool {
+	t.Helper()
+	tv := unix.NsecToTimeval((100 * time.Millisecond).Nanoseconds())
+	if err := unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &tv); err != nil {
+		t.Fatalf("unix.SetsockoptTimeval failed: %v", err)
+	}
+	const ndNeighborSolicit = 135
+	ip := net.ParseIP(target)
+	buf := make([]byte, maxFrameLen)
+	for deadline := time.Now().Add(timeout); time.Now().Before(deadline); {
+		n, err := unix.Read(fd, buf)
+		if err != nil {
+			continue
+		}
+		f := buf[:n]
+		// eth(14) + ipv6(40) + NS: type(1) code(1) csum(2) reserved(4) target(16)
+		if n >= 14+40+24 && binary.BigEndian.Uint16(f[12:14]) == unix.ETH_P_IPV6 &&
+			f[14+6] == 58 && f[14+40] == ndNeighborSolicit && net.IP(f[14+48:14+64]).Equal(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestNoNeighborResolution checks that the ENI's netns sends a packet
+// straight out its veth without first resolving the next hop: `add` turns
+// ARP/ND off on veth-inner (see cmd/add.go), since nothing would ever answer
+// for an address the root netns doesn't own. The datagram here, to an
+// on-link address nothing answers for, must reach encap (a flow miss, since
+// decap never delivered its flow) rather than wait on a Neighbor
+// Solicitation.
+func TestNoNeighborResolution(t *testing.T) {
+	requireRoot(t)
+	_ = unix.Mount("bpf", "/sys/fs/bpf", "bpf", 0, "")
+
+	gwlbID := uint64(0xE2E)
+
+	setupUplink(t)
+	runSetup(t, 8)
+	one := provisionENI(t, gwlbID, true, echoServerPort, bytes.Clone)
+	fd := watchVethOuter(t, one.outerIfindex)
+
+	const unresolved = "2001:db8::99"
+	missBefore := metricSum(t, "encap_drop_flow_miss_packets", one.outerIfindex)
+	sendFromENINetns(t, gwlbID, unresolved)
+
+	if sawNeighborSolicit(t, fd, unresolved, time.Second) {
+		t.Errorf("Neighbor Solicitation for %s observed on veth-outer, want none (ARP off on veth-inner)", unresolved)
+	}
+	if got := metricSum(t, "encap_drop_flow_miss_packets", one.outerIfindex); got != missBefore+1 {
+		t.Errorf("encap_drop_flow_miss_packets = %d, want %d (the datagram itself, sent unresolved)", got, missBefore+1)
+	}
+}
+
 // TestNeighborDiscoveryPassed checks that IPv6 Neighbor Discovery (and MLD)
 // the ENI's netns sends out its veth reaches the root netns rather than
 // being dropped by encap as a flow miss: they're IPv6 packets, but never a
 // reply to anything decap delivered (see icmpv6_is_link_local_control in
-// bpf/geneve_defs.h).
+// bpf/geneve_defs.h). `add` turns ARP/ND off on veth-inner, so this turns it
+// back on first — as a --script could — to get a Neighbor Solicitation sent.
 func TestNeighborDiscoveryPassed(t *testing.T) {
 	requireRoot(t)
 	_ = unix.Mount("bpf", "/sys/fs/bpf", "bpf", 0, "")
@@ -229,57 +315,26 @@ func TestNeighborDiscoveryPassed(t *testing.T) {
 
 	setupUplink(t)
 	runSetup(t, 8)
-	one := provisionENI(t, gwlbID, true, echoServerPort, fakeClientMAC, bytes.Clone)
+	one := provisionENI(t, gwlbID, true, echoServerPort, bytes.Clone)
+	fd := watchVethOuter(t, one.outerIfindex)
 
-	// Watch veth-outer from the root netns: a packet socket there only sees
-	// what encap passed to the stack.
-	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(unix.ETH_P_ALL)))
-	if err != nil {
-		t.Fatalf("unix.Socket failed: %v", err)
-	}
-	t.Cleanup(func() { unix.Close(fd) })
-	if err := unix.Bind(fd, &unix.SockaddrLinklayer{Protocol: htons(unix.ETH_P_ALL), Ifindex: int(one.outerIfindex)}); err != nil {
-		t.Fatalf("unix.Bind failed: %v", err)
-	}
+	inENINetns(t, gwlbID, func() error {
+		link, err := netlink.LinkByName(cmd.FormatInterfaceName(gwlbID, true))
+		if err != nil {
+			return err
+		}
+		return netlink.LinkSetARPOn(link)
+	})
 
 	// A datagram to an on-link address with no neighbor entry makes the
 	// netns kernel send a Neighbor Solicitation for it.
 	const unresolved = "2001:db8::99"
-	inENINetns(t, gwlbID, func() error {
-		conn, err := net.DialUDP("udp6", nil, &net.UDPAddr{IP: net.ParseIP(unresolved), Port: 9})
-		if err != nil {
-			return err
-		}
-		defer conn.Close()
-		_, err = conn.Write([]byte("resolve me"))
-		return err
-	})
-
-	tv := unix.NsecToTimeval((100 * time.Millisecond).Nanoseconds())
-	if err := unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &tv); err != nil {
-		t.Fatalf("unix.SetsockoptTimeval failed: %v", err)
-	}
-	const ndNeighborSolicit = 135
-	target := net.ParseIP(unresolved)
-	buf := make([]byte, maxFrameLen)
-	found := false
-	for deadline := time.Now().Add(5 * time.Second); !found && time.Now().Before(deadline); {
-		n, err := unix.Read(fd, buf)
-		if err != nil {
-			continue
-		}
-		f := buf[:n]
-		// eth(14) + ipv6(40) + NS: type(1) code(1) csum(2) reserved(4) target(16)
-		if n >= 14+40+24 && binary.BigEndian.Uint16(f[12:14]) == unix.ETH_P_IPV6 &&
-			f[14+6] == 58 && f[14+40] == ndNeighborSolicit && net.IP(f[14+48:14+64]).Equal(target) {
-			found = true
-		}
-	}
-	if !found {
+	sendFromENINetns(t, gwlbID, unresolved)
+	if !sawNeighborSolicit(t, fd, unresolved, 5*time.Second) {
 		t.Fatalf("no Neighbor Solicitation for %s observed on veth-outer within 5s — encap dropped it?", unresolved)
 	}
 
-	// Everything the netns has sent so far — this NS, DAD, MLD reports — was
+	// Everything the netns has sent so far — this NS, MLD reports — was
 	// link-local control traffic, none of it a flow miss.
 	if got := metricSum(t, "encap_drop_flow_miss_packets", one.outerIfindex); got != 0 {
 		t.Errorf("encap_drop_flow_miss_packets = %d, want 0 (ND/MLD should be passed, not looked up)", got)
@@ -330,7 +385,7 @@ func TestFragmentedReply(t *testing.T) {
 	runSetup(t, 8)
 	// Each reply is three copies of its request: 4000 bytes in, 12000 out —
 	// over the netns's 8500-byte route MTU, so the backend fragments it.
-	one := provisionENI(t, gwlbID, true, echoServerPort, fakeClientMAC, func(b []byte) []byte { return bytes.Repeat(b, 3) })
+	one := provisionENI(t, gwlbID, true, echoServerPort, func(b []byte) []byte { return bytes.Repeat(b, 3) })
 	fd := openGWLBSocket(t, gwlbIface)
 
 	payload := bytes.Repeat([]byte("0123456789abcdef"), 250) // 4000 bytes
@@ -456,7 +511,7 @@ func TestDecapOversizeDropped(t *testing.T) {
 		t.Fatalf("netlink.LinkSetMTU failed: %v", err)
 	}
 	runSetup(t, 8)
-	one := provisionENI(t, gwlbID, true, echoServerPort, fakeClientMAC, bytes.Clone)
+	one := provisionENI(t, gwlbID, true, echoServerPort, bytes.Clone)
 	fd := openGWLBSocket(t, gwlbIface)
 
 	// 20 + 8 + 8907 = an 8935-byte inner packet, 2 over the limit.
@@ -553,7 +608,7 @@ func TestLargeRequests(t *testing.T) {
 
 	uplinkIface, gwlbIface := setupUplink(t)
 	runSetup(t, 8)
-	one := provisionENI(t, gwlbID, true, echoServerPort, fakeClientMAC, func(b []byte) []byte { return bytes.Clone(b[:min(len(b), replyLen)]) })
+	one := provisionENI(t, gwlbID, true, echoServerPort, func(b []byte) []byte { return bytes.Clone(b[:min(len(b), replyLen)]) })
 	fd := openGWLBSocket(t, gwlbIface)
 
 	cases := []struct {
@@ -662,7 +717,7 @@ func TestEncapOversizeDropped(t *testing.T) {
 	if err := netlink.LinkSetMTU(uplink, 9001); err != nil {
 		t.Fatalf("netlink.LinkSetMTU failed: %v", err)
 	}
-	one := provisionENI(t, gwlbID, true, echoServerPort, fakeClientMAC, func(b []byte) []byte { return bytes.Repeat(b, 2) })
+	one := provisionENI(t, gwlbID, true, echoServerPort, func(b []byte) []byte { return bytes.Repeat(b, 2) })
 	fd := openGWLBSocket(t, gwlbIface)
 
 	payload := make([]byte, 1000) // reply: 20 + 8 + 2000 = 2028 bytes
@@ -706,7 +761,7 @@ func TestTCPBulkReply(t *testing.T) {
 
 	uplinkIface, gwlbIface := setupUplink(t)
 	runSetup(t, 8)
-	one := provisionENI(t, gwlbID, true, echoServerPort, fakeClientMAC, bytes.Clone)
+	one := provisionENI(t, gwlbID, true, echoServerPort, bytes.Clone)
 	fd := openGWLBSocket(t, gwlbIface)
 
 	bulk := make([]byte, bulkLen)
