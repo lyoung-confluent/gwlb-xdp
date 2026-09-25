@@ -3,6 +3,7 @@ package cmd
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
+	"golang.org/x/sys/unix"
 
 	"github.com/lyoung-confluent/gwlb-xdp/bpf"
 	"github.com/lyoung-confluent/gwlb-xdp/bpf/decap"
@@ -239,6 +241,18 @@ func RunAdd(vpceID string, scriptPath string, isolated bool, mtu int) (err error
 		return err
 	}
 
+	// Default routes out the inner end, so the backend can reply to clients
+	// that aren't on-link — which, behind GWLB, is nearly all of them. It's
+	// the netns's only way out, and with ARP off no next hop is ever
+	// resolved (and encap replaces the MAC anyway), so a plain device route
+	// is right whatever the backend's addressing. Never in the root netns:
+	// that would replace the host's own default route.
+	if isolated {
+		if err := addDefaultRoutes(nsh, inner); err != nil {
+			return err
+		}
+	}
+
 	// Last chance to finish backend setup before this endpoint is wired up and
 	// reachable below (see the --script flag). Runs inside the endpoint's own
 	// netns when isolated, so the script can address innerName directly
@@ -291,6 +305,33 @@ func RunAdd(vpceID string, scriptPath string, isolated bool, mtu int) (err error
 		return fmt.Errorf("encap.Attach for %q failed: %w", outerName, err)
 	}
 
+	return nil
+}
+
+// addDefaultRoutes adds IPv4 and IPv6 default routes out link, via nsh.
+// The IPv6 one is skipped if IPv6 is disabled, on the host or the link.
+func addDefaultRoutes(nsh *netlink.Handle, link netlink.Link) error {
+	name := link.Attrs().Name
+	v4 := &netlink.Route{
+		LinkIndex: link.Attrs().Index,
+		Dst:       &net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)},
+		Scope:     netlink.SCOPE_LINK,
+	}
+	if err := nsh.RouteAdd(v4); err != nil {
+		return fmt.Errorf("(*netlink.Handle).RouteAdd for 0.0.0.0/0 dev %s failed: %w", name, err)
+	}
+	v6 := &netlink.Route{
+		LinkIndex: link.Attrs().Index,
+		Dst:       &net.IPNet{IP: net.IPv6zero, Mask: net.CIDRMask(0, 128)},
+	}
+	if err := nsh.RouteAdd(v6); err != nil {
+		// EACCES: disable_ipv6 on link. EOPNOTSUPP/EAFNOSUPPORT: booted
+		// with ipv6.disable=1.
+		if errors.Is(err, unix.EACCES) || errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.EAFNOSUPPORT) {
+			return nil
+		}
+		return fmt.Errorf("(*netlink.Handle).RouteAdd for ::/0 dev %s failed: %w", name, err)
+	}
 	return nil
 }
 

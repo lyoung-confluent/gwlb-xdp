@@ -341,6 +341,70 @@ func TestNeighborDiscoveryPassed(t *testing.T) {
 	}
 }
 
+// TestOffLinkClient checks that the backend can reply to a client outside
+// its own subnet — as GWLB's clients nearly always are — with no route set
+// up by a --script: `add` gives the netns its own default routes (see
+// cmd/add.go). Every other test's client is on-link.
+func TestOffLinkClient(t *testing.T) {
+	requireRoot(t)
+	_ = unix.Mount("bpf", "/sys/fs/bpf", "bpf", 0, "")
+
+	gwlbID := uint64(0xE2E)
+
+	uplinkIface, gwlbIface := setupUplink(t)
+	runSetup(t, 8)
+	provisionEndpoint(t, gwlbID, true, echoServerPort, bytes.Clone)
+	fd := openGWLBSocket(t, gwlbIface)
+
+	cases := []struct {
+		name      string
+		v6        bool
+		ethertype layers.EthernetType
+		clientIP  string
+		serverIP  string
+	}{
+		{"ipv4", false, layers.EthernetTypeIPv4, "203.0.113.7", echoServerIP},
+		{"ipv6", true, layers.EthernetTypeIPv6, "2001:db8:1::7", echoServerIP6},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := []byte("from off-link")
+			var inner []byte
+			var err error
+			if tc.v6 {
+				inner, err = buildInnerUDPv6(net.ParseIP(tc.clientIP), net.ParseIP(tc.serverIP), fakeClientPort, echoServerPort, payload)
+			} else {
+				inner, err = buildInnerUDPv4(net.ParseIP(tc.clientIP), net.ParseIP(tc.serverIP), fakeClientPort, echoServerPort, payload)
+			}
+			if err != nil {
+				t.Fatalf("building the inner request failed: %v", err)
+			}
+			sendFrame(t, fd, gwlbIface, innerRequestFrame(t, uplinkIface, gwlbIface, gwlbID, fakeFlowCookie, inner, tc.ethertype))
+
+			if !collectReplies(t, fd, uplinkIface.HardwareAddr, 5*time.Second, func(f []byte) bool {
+				var dst net.IP
+				var got []byte
+				if tc.v6 {
+					r, err := parseUDPReplyV6(f)
+					if err != nil {
+						return false
+					}
+					dst, got = r.innerDstIP, r.payload
+				} else {
+					r, err := parseReply(f)
+					if err != nil {
+						return false
+					}
+					dst, got = r.innerDstIP, r.payload
+				}
+				return dst.Equal(net.ParseIP(tc.clientIP)) && bytes.Equal(got, payload)
+			}) {
+				t.Fatalf("no echo reply to off-link client %s observed within 5s", tc.clientIP)
+			}
+		})
+	}
+}
+
 // fragment is one IP fragment's slice of its datagram's payload.
 type fragment struct {
 	offset int
