@@ -32,38 +32,44 @@ Each VPC endpoint (`vpce-...`) gets its own netns and veth pair, so the backend 
 
 ## Usage
 
+A typical host runs `setup` once, `add` for each VPC endpoint, and `serve` for health checks and metrics:
+
 ```
-gwlb-xdp setup --allowed-origin-cidr <gwlb-cidr> <uplink-ifname>  # load decap+encap, attach decap to the uplink
-gwlb-xdp add <vpce-id>       # provision one VPC endpoint: netns + veth pair + attach encap
-gwlb-xdp remove <vpce-id>    # undo add
-gwlb-xdp teardown            # undo setup, removing any endpoints still provisioned
-gwlb-xdp serve               # HTTP health endpoint, optionally pushing counters to statsd
+gwlb-xdp setup --allowed-origin-cidr 10.0.0.0/16 eth0
+gwlb-xdp add --script /etc/gwlb-xdp/configure.sh vpce-0123456789abcdef0
+gwlb-xdp serve --interval 10s
 ```
 
 VPC endpoint IDs can be in AWS's current 17-hex-digit form (`vpce-0123456789abcdef0`) or the legacy 8-digit form (`vpce-1a2b3c4d`), in any case.
 
 `setup`, `add`, `remove` and `teardown` take an exclusive lock on `/run/gwlb-xdp.lock`, so concurrent calls run one at a time instead of racing.
 
-### Flags
+### `setup`
 
-| Command | Flag | Default | Description |
-|---|---|---|---|
-| `setup` | `--allowed-origin-cidr` | *(required)* | Only accept GENEVE packets whose outer source IPv4 address is in this CIDR (the GWLB's subnet). Pass `0.0.0.0/0` to accept every origin. |
-| `setup` | `--max-enis` | `128` | Maximum number of VPC endpoints on this host. |
-| `setup` | `--max-flows` | `1048576` | Maximum number of tracked flows, IPv4 and IPv6 combined. |
-| `setup` | `--transparent` | `false` | Treat every endpoint as a transparent appliance (replies keep the request's 5-tuple rather than swapping it). Usually needs a larger `add --mtu`; see [MTU and offloads](#mtu-and-offloads). |
-| `add` | `--script` | | Executable run with the netns name and inner interface name as arguments, after the veth is up but before traffic can reach it. Use it to configure the backend side. |
-| `add` | `--mtu` | `8500` | MTU of the endpoint's veth pair, which caps what the backend both sends and receives. The default is GWLB's documented MTU, lowered to the uplink's limit (its MTU minus 68) if that's smaller. |
-| `add` | `--no-netns` | `false` | Keep the inner veth end in the root netns. Only safe if no two endpoints on the host have overlapping backend addresses. |
-| `serve` | `--listen` | `:6082` | Address for the HTTP health server. |
-| `serve` | `--statsd` | `127.0.0.1:8125` | statsd endpoint for counters (typically the local CloudWatch agent). |
-| `serve` | `--interval` | `0` | How often to push counters to statsd. `0` disables pushing. |
+```
+gwlb-xdp setup --allowed-origin-cidr <cidr> [flags] <uplink-ifname>
+```
 
-`--allowed-origin-cidr` is required so that accepting all traffic is an explicit choice. Without it, anyone who can reach UDP 6081 could inject packets into an endpoint's netns or hijack a flow's replies. If AWS security groups already restrict who can reach UDP 6081 on this host, you can set it to `0.0.0.0/0` and let the security group do the filtering.
+Loads decap and encap and attaches decap to the uplink interface.
 
-### Configuring the backend netns
+- `--allowed-origin-cidr` *(required)*: only accept GENEVE packets whose outer source IPv4 address is in this CIDR (the GWLB's subnet). It's required so that accepting all traffic is an explicit choice. Without it, anyone who can reach UDP 6081 could inject packets into an endpoint's netns or hijack a flow's replies. If AWS security groups already restrict who can reach UDP 6081 on this host, you can set it to `0.0.0.0/0` and let the security group do the filtering.
+- `--max-enis` (default `128`): maximum number of VPC endpoints on this host.
+- `--max-flows` (default `1048576`): maximum number of tracked flows, IPv4 and IPv6 combined.
+- `--transparent` (default `false`): treat every endpoint as a transparent appliance, so replies keep the request's 5-tuple rather than swapping it. Usually needs a larger `add --mtu`; see [MTU and offloads](#mtu-and-offloads).
 
-`add` creates the netns and veth but leaves addressing and routing to your `--script`. For example:
+### `add`
+
+```
+gwlb-xdp add [flags] <vpce-id>
+```
+
+Provisions one VPC endpoint: creates its netns and veth pair and attaches encap. See [What `add` does](#what-add-does) for the details.
+
+- `--script <path>`: an executable run with the netns name and inner interface name as arguments, after the veth is up but before traffic can reach it. Use it to configure the backend side (see below).
+- `--mtu` (default `8500`): MTU of the endpoint's veth pair, which caps what the backend both sends and receives. The default is GWLB's documented MTU, lowered to the uplink's limit (its MTU minus 68) if that's smaller.
+- `--no-netns` (default `false`): keep the inner veth end in the root netns. Only safe if no two endpoints on the host have overlapping backend addresses.
+
+`add` leaves addressing and routing to your `--script`. For example:
 
 ```sh
 #!/bin/sh
@@ -74,11 +80,35 @@ ip -n "$1" route add default via 10.0.0.1 dev "$2"
 
 The default veth MTU of 8500 keeps replies within what GWLB will carry, so no route MTU is needed. This assumes the backend terminates connections (a NAT or proxy, say). A transparent appliance (`setup --transparent`) needs a larger `--mtu`; see [MTU and offloads](#mtu-and-offloads).
 
-### Health and metrics
+### `remove`
 
-`serve` returns HTTP 200 only while decap is attached and the uplink is up with carrier.
+```
+gwlb-xdp remove <vpce-id>
+```
 
-With `--interval` set, `serve` also reads the per-interface packet and byte counters and pushes how much each grew since the last sample to statsd as counters (`|c`). They're tagged with `interface` and, for endpoints, `gwlb_id` (the lowercase VPC endpoint ID). Byte counters count full encapsulated frames as they cross the uplink, in both directions. Datagrams are at most 1432 bytes.
+Undoes `add` for one VPC endpoint, deleting its veth pair, netns and cached state. It takes no flags.
+
+### `teardown`
+
+```
+gwlb-xdp teardown
+```
+
+Undoes `setup`: removes every endpoint still provisioned, detaches decap and deletes the pinned BPF state. It takes no flags.
+
+### `serve`
+
+```
+gwlb-xdp serve [flags]
+```
+
+Serves an HTTP health endpoint and optionally pushes counters to statsd. It returns HTTP 200 on any path, but only while decap is attached and the uplink is up with carrier.
+
+- `--listen` (default `:6082`): address for the HTTP health server.
+- `--interval` (default `0`): how often to push counters to statsd. `0` disables pushing, leaving just the health endpoint.
+- `--statsd` (default `127.0.0.1:8125`): the statsd endpoint to push to, typically the local CloudWatch agent.
+
+With `--interval` set, `serve` reads the per-interface packet and byte counters and pushes how much each grew since the last sample to statsd as counters (`|c`). They're tagged with `interface` and, for endpoints, `gwlb_id` (the lowercase VPC endpoint ID). Byte counters count full encapsulated frames as they cross the uplink, in both directions. Datagrams are at most 1432 bytes.
 
 ## Building and testing
 
