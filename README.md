@@ -1,135 +1,217 @@
 # gwlb-xdp
 
-A PoC using XDP/eBPF to parse/redirect GENEVE traffic to/from an [AWS Gateway Load Balancer](https://docs.aws.amazon.com/elasticloadbalancing/latest/gateway/introduction.html) (gwlb) into different [Linux network namespaces](https://man7.org/linux/man-pages/man7/network_namespaces.7.html) for each attached VPC endpoint. Essentially a kernel-mode implementation of [aws-gateway-load-balancer-tunnel-handler](https://github.com/aws-samples/aws-gateway-load-balancer-tunnel-handler).
+A proof of concept that uses XDP/eBPF to terminate GENEVE traffic from an [AWS Gateway Load Balancer](https://docs.aws.amazon.com/elasticloadbalancing/latest/gateway/introduction.html) (GWLB) and hand each attached VPC endpoint's traffic to its own [Linux network namespace](https://man7.org/linux/man-pages/man7/network_namespaces.7.html). It's essentially a kernel-mode version of [aws-gateway-load-balancer-tunnel-handler](https://github.com/aws-samples/aws-gateway-load-balancer-tunnel-handler).
 
-## Architecture
+## How it works
 
-`gwlb-xdp` is a CLI ([main.go](main.go), commands in [cmd/](cmd)) that loads and wires up two XDP programs, then exits — packet processing happens entirely in the kernel, driven by nothing running in userspace. The programs and the maps they share are pinned under `/sys/fs/bpf/gwlb-xdp` ([bpf/maps.go](bpf/maps.go)) so they keep running (and can be found by later invocations of the CLI) after the loader process exits.
+`gwlb-xdp` is a CLI that loads two XDP programs into the kernel, wires them up, and exits. There is no userspace process on the packet path. The programs and their shared maps are pinned under `/sys/fs/bpf/gwlb-xdp`, so they keep running after the CLI exits and later commands can find them.
 
-```
-+----------------------------------------------------------------+
-|   physical uplink (single NIC, shared by every VPC endpoint)   |
-+----------------------------------------------------------------+
-                |                                 ^
-                | GENEVE/UDP from GWLB            | reply GENEVE/UDP to GWLB
-                v                                 |
-+------------------------------+  +------------------------------+
-|         decap (XDP)          |  |         encap (XDP)          |
-|        attached once,        |  |      attached per ENI,       |
-|        on the uplink         |  |        on veth-outer         |
-+------------------------------+  +------------------------------+
-                |                                 ^
-                | redirect via                    | redirect via
-                | eni_to_ifindex;                 | flow_state
-                | cache outer hdr                 | (cached outer
-                | in flow_state                   | hdr replayed)
-                v                                 |
-+----------------------------------------------------------------+
-|        veth-outer (gxdp<base58 ENI id>, default netns)         |
-+----------------------------------------------------------------+
-                |                                 ^
-                | veth pair                       |
-                | (crosses into                   |
-                | the ENI's netns)                |
-                v                                 |
-+----------------------------------------------------------------+
-|    veth-inner (gwlb<base58 ENI id>, inside vpce-... netns)     |
-|                 -> appliance / backend traffic                 |
-+----------------------------------------------------------------+
-```
-
-### Two XDP programs, one shared cache
-
-- **[decap](bpf/decap/_decap.c)** is attached once, to the physical uplink interface (`setup`). For every inbound GENEVE/UDP packet it parses GWLB's fixed 3-option GENEVE layout — ENI ID, attachment ID, flow cookie, always in that order and always that length, so no options loop is needed — to pull out the AWS ENI ID, looks that up in the `eni_to_ifindex` map to find which VPC endpoint's veth pair it belongs to, strips the outer Ethernet/IP/UDP/GENEVE headers, synthesizes a new Ethernet header addressed to that veth, and redirects the bare inner packet onto it (`bpf_redirect`). Before stripping, it caches the entire outer header in `flow_state` — with its Ethernet and IP addressing already swapped into reply orientation, and its TTL, ECN bits, DF flag and IP ID set to what a new reply datagram should carry (TTL 64, Not-ECT, DF, ID 0) rather than inherited from the request — keyed by the inner packet's 5-tuple plus the veth's ifindex. The entry is only rewritten when the flow's encapsulation actually changes (a different GWLB node, outer port or flow cookie), not on every packet. Outer IP fragments are never decapped (GWLB doesn't fragment its outer packets, and a first fragment's inner packet would be truncated). Non-first inner fragments (no L4 header to key on) and ICMP errors (which never elicit a reply) are delivered without caching anything, and an inner packet larger than one GENEVE packet on the uplink can carry — e.g. GENEVE packets GRO merged before decap ran — is dropped and counted as oversize.
-- **[encap](bpf/encap/_encap.c)** is loaded once at `setup` but attached separately per ENI, to that ENI's veth-outer end (`add`). When the backend behind that veth replies, encap looks its 5-tuple up in the same `flow_state` map (swapped or literal, depending on whether the ENI is NAT/terminating or transparent — see `eni_mode` below), replays the cached outer header bytes completely unmodified — decap already pre-swapped its addressing — except for the fields that depend on this specific reply's own size (recomputed IPv4 checksum, total length), and redirects the packet back out the uplink toward GWLB. Three kinds of reply can't be matched by their own tuple and are handled specially:
-  - **ICMP/ICMPv6 errors** the backend generates about a flow (port unreachable, time exceeded, packet too big, parameter problem) are matched through the packet they quote — the one decap delivered — so they go back with that flow's own GENEVE options, flow cookie included.
-  - **Fragments**: a datagram's first fragment is matched normally and recorded in `frag_state`; its later fragments, which carry no L4 header, are matched through that.
-  - **IPv6 Neighbor Discovery and MLD** (ICMPv6 types 130–143) between the netns and its veth are passed to the kernel, like ARP, rather than looked up.
-
-  A reply too large to leave the uplink once encapsulated (see `max_inner_len` below) is dropped and counted as oversize rather than redirected into a silent drop.
-
-Both programs are compiled from C to CO-RE-free BPF object code by [bpf2go](https://github.com/cilium/ebpf) (`go generate`, see the `//go:generate` directives in [decap.go](bpf/decap/decap.go) and [encap.go](bpf/encap/encap.go)); the generated `.o` files and Go bindings are checked in, so a normal `go build` doesn't need clang/libbpf at all — only `make generate`/`make verify` do (see [Dockerfile](Dockerfile) and [Makefile](Makefile)).
-
-### Per-ENI isolation: one netns, one veth pair
-
-Each attached VPC endpoint (`vpce-...`) is provisioned independently at runtime with `gwlb-xdp add <vpce-id>` ([cmd/add.go](cmd/add.go)). `add` refuses an ENI that's already provisioned, and if it fails partway it rolls back only what it created itself — never a veth, netns or map entry that was already there:
-
-1. Create a named network namespace for the VPC endpoint.
-2. Create a veth pair with an MTU of the uplink's MTU minus GENEVE's 68 bytes (8933 on a 9001-byte uplink) — the largest inner packet decap can deliver, since veth drops a frame over the receiving end's MTU — both ends named from the AWS ENI ID (`FormatInterfaceName` in [cmd/utils.go](cmd/utils.go)) — `gxdp<id>` for the outer end, `gwlb<id>` for the inner — and move the inner end into the new netns. Both ends get MACs derived from the ENI ID rather than the kernel's random ones (`FormatInterfaceMAC` in [cmd/utils.go](cmd/utils.go)): `02` for the outer end or `06` for the inner, then the last 10 hex digits of the VPC endpoint ID — `06:78:9a:bc:de:f0` for `vpce-0123456789abcdef0`'s inner end — so they're recognizable in a capture and stay the same across `remove`/`add`. Being explicitly assigned also keeps systemd-udevd off them: its default `MACAddressPolicy=persistent` replaces a kernel-random MAC asynchronously, which could happen after `add` has recorded it for decap.
-3. Disable TX checksum offload and every segmentation/GRO offload (TSO, GSO, USO, GRO, ...) on both veth ends (`vethDisabledFeatures` in [cmd/add.go](cmd/add.go)). BPF can't compute the real L4 checksum for the netns's egress traffic, so the kernel must write it before encap ever sees the packet; and every packet crossing the veth must be a single wire-sized packet, since a GSO super-packet reaching encap would be encapsulated as one oversized frame and dropped on the way out.
-4. Optionally run a `--script` hook (netns name + interface name as args) so the backend/appliance side can finish its own setup before the ENI is reachable. This is where the netns's addresses and routes belong — including the route MTU its replies need (see [MTU and offloads](#mtu-and-offloads)).
-5. Read both ends' MACs — only now, since the script may set the inner end's address itself, and decap writes that address into every frame it delivers — and insert `(ENI ID → outer ifindex, inner MAC, outer MAC)` into `eni_to_ifindex` and attach the shared `encap` program to the veth-outer — this is the last step, since it's what makes the ENI live.
-
-`gwlb-xdp remove <vpce-id>` ([cmd/remove.go](cmd/remove.go)) reverses this: delete the `eni_to_ifindex` entry, detach encap, delete the veth pair (which removes both ends), then sweep any `flow_state`/`frag_state`/`metrics` entries still keyed by that ENI's ifindex so a later ENI that recycles the same ifindex doesn't inherit stale cache hits, and finally delete the netns. The sweep comes after the veth is gone on purpose: until then, packets already in decap or encap can still write entries for that ifindex. `gwlb-xdp teardown` ([cmd/teardown.go](cmd/teardown.go)) does this for every provisioned ENI, then detaches decap and removes the whole pin directory.
-
-Namespacing each VPC endpoint this way means the appliance/backend logic behind each ENI runs in full network isolation from the others, while decap/encap — running once each, in the root context — do the actual per-ENI dispatch and caching using ifindex as the tenant key.
-
-`add --no-netns` skips the dedicated netns: the inner end (`gwlb<id>`) stays in the root netns alongside the outer end (`gxdp<id>`) instead of migrating — the naming is the same either way (see `FormatInterfaceName` in [cmd/utils.go](cmd/utils.go)). This only makes sense when no two ENIs on the box have overlapping backend addressing, since without separate netns nothing keeps their routing tables apart — which is also why netns isolation is the default rather than an opt-in.
-
-### Shared BPF state
-
-All maps live in [bpf/maps.h](bpf/maps.h) (`metrics` and `flow_state`), [bpf/decap/_decap.c](bpf/decap/_decap.c) (`eni_to_ifindex`) and [bpf/encap/_encap.c](bpf/encap/_encap.c) (`frag_state`), pinned by name so both programs' loads resolve to the same underlying map:
-
-| Map | Purpose |
-|---|---|
-| `eni_to_ifindex` | AWS ENI ID → veth-outer ifindex + synthesized L2 addressing. Sized by `--max-enis` at `setup`. |
-| `flow_state` | Inner 5-tuple (+ ifindex) → cached outer header bytes, one LRU hash shared by IPv4 and IPv6 flows alike (`struct flow_key`'s own family tag tells them apart) so old flows age out automatically. Sized by `--max-flows` for both families combined. Sharing one map trades away the hard per-family capacity isolation two separate maps gave — a burst of one family's flows can now evict the other's — for less space wasted on a v4 entry's unused address bytes. |
-| `frag_state` | encap's in-flight reply fragment tracking: a first fragment's (addresses, protocol, fragment id) → its flow's cached outer header, so the later fragments can find it. Fixed at 16384 entries, LRU — an entry only needs to outlive one datagram. |
-| `metrics` | Per-(ifindex, counter) packet and byte counts, per-CPU. Every `_bytes` counter counts full frames as they cross the uplink — encapsulated, in both directions. With `--interval` set to a positive duration, `gwlb-xdp serve` ([cmd/serve.go](cmd/serve.go)) samples this map that often and pushes how much each counter grew since the previous sample as a statsd counter (`|c`) to a statsd endpoint (the local CloudWatch agent by default), tagged with `interface` and, for ENIs, `gwlb_id`. Pushing is off by default (`--interval 0`), leaving `serve` a health-only endpoint. |
-
-A few `.rodata` knobs set at `setup` fix behavior for the life of the loaded program rather than being looked up per packet: `eni_mode` (NAT/terminating vs. transparent-appliance reply orientation), the uplink's ifindex (so encap can redirect replies without a map lookup), `max_inner_len` in both programs — uplink MTU − 68, the largest inner packet decap delivers and encap sends — and `allowed_origin_addr`/`allowed_origin_mask`, the one GENEVE outer source IPv4 CIDR decap accepts, from `--allowed-origin-cidr`. A GENEVE packet from outside it is dropped and counted in `decap_drop_origin_not_allowed_{packets,bytes}`. The CLI requires the flag, so accepting every origin is an explicit choice (`--allowed-origin-cidr 0.0.0.0/0`, the all-zero default): otherwise anyone who can reach UDP 6081 could inject packets into an ENI's netns, or overwrite a flow's cached outer header and redirect its replies.
-
-### Build & deploy
-
-[Dockerfile](Dockerfile) has three stages: `dev` (clang/llvm/libbpf/bpftool, used by `make generate` and `make verify` to rebuild the checked-in BPF objects and sanity-check them against the kernel verifier), `build` (compiles the static, CGO-free Go binary against the checked-in bindings — no BPF toolchain needed), and `final` (just that binary on `scratch`). Normal iteration only needs `go build`; the dev container is for regenerating or verifying the BPF side after editing `_decap.c`/`_encap.c`.
-
-### End-to-end test
-
-[test/e2e](test/e2e) exercises decap and encap together without a real GWLB: it synthesizes an AWS GWLB GENEVE packet and sends it into a veth pair standing in for the physical uplink, lets `setup`/`add`'s real veths, netns and a UDP echo server (standing in for the backend) carry it end to end, and checks the GENEVE reply that comes back — verbatim outer-header replay, swapped addressing, and the echoed payload all included. A separate ICMP test (`TestICMPEcho`) checks the same round trip for a ping instead of UDP, needing no backend server at all — the kernel answers an echo request addressed to one of its own interfaces on its own. [datapath_test.go](test/e2e/datapath_test.go) covers the replies that can't be matched by their own tuple — ICMP errors, fragmented replies, Neighbor Discovery — plus both oversize drops and a TCP burst that must arrive fully segmented. It needs real netns/veth/XDP support (`CAP_NET_ADMIN`/`CAP_SYS_ADMIN`/`CAP_BPF`), so run it via:
+- **decap** runs on the physical uplink. It receives GENEVE packets from GWLB, reads the ENI ID that GWLB puts in the GENEVE options, strips the outer headers, and redirects the inner packet to that VPC endpoint's veth pair. It also caches the outer header so the reply can reuse it.
+- **encap** runs on each VPC endpoint's veth. When the backend replies, encap finds the cached outer header for that flow, puts it back on the packet, and sends the packet back out the uplink to GWLB.
 
 ```
-make e2e
+                 physical uplink (one NIC, shared by every VPC endpoint)
+                    |                                    ^
+      GENEVE from   |                                    |  GENEVE reply
+      GWLB          v                                    |  to GWLB
+            +---------------+    flow_state cache    +---------------+
+            |  decap (XDP)  | ---------------------> |  encap (XDP)  |
+            |  on uplink    |   (outer header saved  |  on each veth |
+            +---------------+    for the reply)      +---------------+
+                    |                                    ^
+      inner packet  v                                    |  reply
+            +---------------------------------------------------------+
+            |  veth pair per VPC endpoint                             |
+            |  gxdp<id> (root netns)  <-->  gwlb<id> (vpce-... netns) |
+            +---------------------------------------------------------+
+                                        |
+                              appliance / backend
 ```
 
-which runs it (and the plain unit tests) inside the same `--privileged` dev container `make verify` uses — this works both locally (Docker Desktop's Linux VM has everything needed) and in CI ([.github/workflows/e2e.yml](.github/workflows/e2e.yml)).
+Each VPC endpoint (`vpce-...`) gets its own netns and veth pair, so the backend behind each one runs fully isolated from the others. decap and encap run once in the root netns and use the veth's ifindex to tell endpoints apart.
 
 ## Usage
 
 ```
 gwlb-xdp setup --allowed-origin-cidr <gwlb-cidr> <uplink-ifname>  # load decap+encap, attach decap to the uplink
-gwlb-xdp add <vpce-0000000aabbccddee>     # provision one ENI: netns + veth + attach encap
-gwlb-xdp remove <vpce-0000000aabbccddee>  # reverse add
-gwlb-xdp teardown                         # reverse setup (and any remaining add's)
-gwlb-xdp serve                            # serve the HTTP liveness endpoint (and optionally push counters to statsd)
+gwlb-xdp add <vpce-id>       # provision one VPC endpoint: netns + veth pair + attach encap
+gwlb-xdp remove <vpce-id>    # undo add
+gwlb-xdp teardown            # undo setup, removing any endpoints still provisioned
+gwlb-xdp serve               # HTTP health endpoint, optionally pushing counters to statsd
 ```
 
-VPC endpoint IDs are accepted in AWS's current 17-hex-digit form or the legacy 8-hex-digit one (`vpce-1a2b3c4d`), in either case; the netns and statsd `gwlb_id` tag always use the canonical lowercase spelling.
+VPC endpoint IDs can be in AWS's current 17-hex-digit form (`vpce-0123456789abcdef0`) or the legacy 8-digit form (`vpce-1a2b3c4d`), in any case.
 
-`serve`'s health endpoint returns 200 only while decap is attached and the uplink it's attached to is up with carrier. Statsd counters go out in datagrams of at most 1432 bytes.
+`setup`, `add`, `remove` and `teardown` take an exclusive lock on `/run/gwlb-xdp.lock`, so concurrent calls run one at a time instead of racing.
 
-`setup`, `add`, `remove` and `teardown` take an exclusive lock on `/run/gwlb-xdp.lock`, so concurrent invocations (a provisioning system adding several ENIs at once, say) run one at a time rather than racing.
+### Flags
 
-### Next-hop resolution in the netns
+| Command | Flag | Default | Description |
+|---|---|---|---|
+| `setup` | `--allowed-origin-cidr` | *(required)* | Only accept GENEVE packets whose outer source IPv4 address is in this CIDR (the GWLB's subnet). Pass `0.0.0.0/0` to accept every origin. |
+| `setup` | `--max-enis` | `128` | Maximum number of VPC endpoints on this host. |
+| `setup` | `--max-flows` | `1048576` | Maximum number of tracked flows, IPv4 and IPv6 combined. |
+| `setup` | `--transparent` | `false` | Treat every endpoint as a transparent appliance (replies keep the request's 5-tuple rather than swapping it). |
+| `add` | `--script` | | Executable run with the netns name and inner interface name as arguments, after the veth is up but before traffic can reach it. Use it to configure the backend side. |
+| `add` | `--no-netns` | `false` | Keep the inner veth end in the root netns. Only safe if no two endpoints on the host have overlapping backend addresses. |
+| `serve` | `--listen` | `:6082` | Address for the HTTP health server. |
+| `serve` | `--statsd` | `127.0.0.1:8125` | statsd endpoint for counters (typically the local CloudWatch agent). |
+| `serve` | `--interval` | `0` | How often to push counters to statsd. `0` disables pushing. |
 
-encap replaces a reply's whole Ethernet header with the cached outer one, so the destination MAC the netns puts on a reply never reaches the wire — but the netns's kernel still won't send the reply until it has resolved *some* neighbor entry for the next hop. Its ARP and Neighbor Discovery go out the veth into the root netns (encap passes them to the kernel), which only answers for addresses it owns itself. Unless the next hop happens to be one of those, `--script` should pin a permanent neighbor entry for it — any unicast MAC will do — alongside the route:
+`--allowed-origin-cidr` is required so that accepting all traffic is an explicit choice. Without it, anyone who can reach UDP 6081 could inject packets into an endpoint's netns or hijack a flow's replies.
+
+### Configuring the backend netns
+
+`add` creates the netns and veth but leaves addressing and routing to your `--script`. Besides the usual addresses and routes, the script needs to set two things:
+
+1. **A route MTU of 8500.** GWLB silently drops replies larger than 8500 bytes and never sends ICMP "fragmentation needed". The veth's own MTU is larger than that (see [MTU details](#mtu-and-offloads)), so set the limit on the routes.
+2. **A permanent neighbor entry for the next hop.** encap replaces the reply's Ethernet header, so the MAC doesn't matter, but the kernel won't send a reply until the next hop resolves. ARP and Neighbor Discovery from the netns only get answers for addresses the root netns owns, so pin an entry with any unicast MAC.
+
+For example:
+
+```sh
+#!/bin/sh
+# $1 = netns name, $2 = inner interface name
+ip -n "$1" addr add 10.0.0.2/24 dev "$2"
+ip -n "$1" route change 10.0.0.0/24 dev "$2" mtu 8500
+ip -n "$1" route add default via 10.0.0.1 dev "$2" mtu 8500
+ip -n "$1" neigh replace 10.0.0.1 lladdr 02:00:00:00:00:01 dev "$2" nud permanent
+```
+
+Every destination the netns reaches directly (on-link, with no `via`) needs its own neighbor entry too, so route replies through a single next hop where you can. The e2e test does this for its fake client (see `provisionENI` in [test/e2e/e2e_test.go](test/e2e/e2e_test.go)).
+
+### Health and metrics
+
+`serve` returns HTTP 200 only while decap is attached and the uplink is up with carrier.
+
+With `--interval` set, `serve` also reads the per-interface packet and byte counters and pushes how much each grew since the last sample to statsd as counters (`|c`). They're tagged with `interface` and, for endpoints, `gwlb_id` (the lowercase VPC endpoint ID). Byte counters count full encapsulated frames as they cross the uplink, in both directions. Datagrams are at most 1432 bytes.
+
+## Building and testing
+
+Normal development only needs `go build`. The BPF programs are compiled from C by [bpf2go](https://github.com/cilium/ebpf), and the generated `.o` files and Go bindings are checked in.
+
+After editing `_decap.c` or `_encap.c`, regenerate and check them against the kernel verifier inside the dev container:
 
 ```
-ip -n "$1" neigh replace <next hop> lladdr 02:00:00:00:00:01 dev "$2" nud permanent
+make generate
+make verify
 ```
 
-Every destination the netns reaches directly (on-link, with no `via`) needs an entry of its own the same way, so route replies through a single next hop where possible. The e2e test does exactly this for its fake client (see `provisionENI` in [test/e2e/e2e_test.go](test/e2e/e2e_test.go)).
+The [Dockerfile](Dockerfile) has three stages:
+
+- `dev`: clang, llvm, libbpf and bpftool, used by `make generate` and `make verify`.
+- `build`: compiles a static, CGO-free Go binary against the checked-in bindings.
+- `final`: just that binary on `scratch`.
+
+### End-to-end tests
+
+[test/e2e](test/e2e) tests decap and encap together without a real GWLB. It builds synthetic GWLB GENEVE packets, sends them into a veth pair standing in for the uplink, runs them through the real `setup`/`add` netns and veths to a UDP echo server, and checks the GENEVE reply that comes back. Other tests cover ICMP echo, ICMP errors, fragmented replies, Neighbor Discovery, oversize drops, and TCP segmentation ([datapath_test.go](test/e2e/datapath_test.go)).
+
+The tests need real netns, veth and XDP support (`CAP_NET_ADMIN`, `CAP_SYS_ADMIN`, `CAP_BPF`), so run them in the privileged dev container:
+
+```
+make e2e
+```
+
+This works locally (Docker Desktop's Linux VM has everything needed) and in CI ([.github/workflows/e2e.yml](.github/workflows/e2e.yml)). It runs the unit tests too.
+
+---
+
+## Technical reference
+
+The rest of this document covers the datapath in detail.
+
+### Code layout
+
+- [main.go](main.go) and [cmd/](cmd): the CLI.
+- [bpf/decap/_decap.c](bpf/decap/_decap.c): the decap XDP program and the `eni_to_ifindex` map.
+- [bpf/encap/_encap.c](bpf/encap/_encap.c): the encap XDP program and the `frag_state` map.
+- [bpf/maps.h](bpf/maps.h): the shared `flow_state` and `metrics` maps.
+- [bpf/maps.go](bpf/maps.go): map pinning under `/sys/fs/bpf/gwlb-xdp`.
+
+### decap
+
+decap is attached once to the uplink by `setup`. For each GENEVE/UDP packet it:
+
+1. Drops the packet if its outer source isn't in `--allowed-origin-cidr`, counting it in `decap_drop_origin_not_allowed_{packets,bytes}`.
+2. Parses GWLB's GENEVE options. GWLB always sends the same three options in the same order and at the same length (ENI ID, attachment ID, flow cookie), so no options loop is needed.
+3. Looks up the ENI ID in `eni_to_ifindex` to find the endpoint's veth.
+4. Caches the outer header in `flow_state`, keyed by the inner packet's 5-tuple plus the veth's ifindex. The cached copy is already in reply form: Ethernet and IP addresses are swapped, and TTL, ECN, DF and IP ID are set to what a new reply should carry (TTL 64, Not-ECT, DF, ID 0) instead of being copied from the request. The entry is only rewritten when the flow's encapsulation changes (a different GWLB node, outer port or flow cookie), not on every packet.
+5. Strips the outer Ethernet, IP, UDP and GENEVE headers, writes a new Ethernet header addressed to the veth, and redirects the inner packet onto it with `bpf_redirect`.
+
+Special cases:
+
+- **Outer IP fragments** are never decapped. GWLB doesn't fragment its outer packets, and a first fragment's inner packet would be truncated.
+- **Non-first inner fragments** (no L4 header to key on) and **ICMP errors** (which never get a reply) are delivered without caching anything.
+- **Oversize inner packets**, larger than one GENEVE packet on the uplink can carry, are dropped and counted as `decap_drop_oversize`. This happens when GRO merged GENEVE packets before decap ran.
+
+### encap
+
+encap is loaded once by `setup` and attached to each endpoint's outer veth end (`gxdp<id>`) by `add`. For each reply from the backend it:
+
+1. Looks up the reply's 5-tuple in `flow_state`. In the default NAT/terminating mode it looks up the swapped tuple. With `--transparent` it looks up the tuple as-is.
+2. Copies the cached outer header back onto the packet unchanged, except for fields that depend on this reply's size (IPv4 total length and checksum). decap already swapped the addressing.
+3. Redirects the packet out the uplink to GWLB.
+
+Some replies can't be matched by their own 5-tuple:
+
+- **ICMP and ICMPv6 errors** from the backend (port unreachable, time exceeded, packet too big, parameter problem) are matched using the packet they quote, which is the one decap delivered. They go back with that flow's GENEVE options, flow cookie included.
+- **Fragments.** A datagram's first fragment is matched normally and recorded in `frag_state`. Later fragments have no L4 header, so they're matched through that record.
+- **IPv6 Neighbor Discovery and MLD** (ICMPv6 types 130–143) between the netns and its veth are passed to the kernel, like ARP, instead of being looked up.
+
+A reply too large to leave the uplink once encapsulated (larger than `max_inner_len`) is dropped and counted as oversize, rather than being redirected into a silent drop.
+
+### What `add` does
+
+`add <vpce-id>` ([cmd/add.go](cmd/add.go)) refuses an endpoint that's already provisioned. If it fails partway, it rolls back only what it created, never a veth, netns or map entry that already existed.
+
+1. **Create a netns** for the endpoint, named after the VPC endpoint ID.
+2. **Create a veth pair** and move the inner end into the netns.
+   - Names come from the ENI ID (`FormatInterfaceName` in [cmd/utils.go](cmd/utils.go)): `gxdp<id>` for the outer end and `gwlb<id>` for the inner end.
+   - MTU is the uplink's MTU minus GENEVE's 68 bytes (8933 on a 9001-byte uplink). That's the largest inner packet decap can deliver, and veth drops frames over the receiving end's MTU.
+   - MACs are derived from the endpoint ID instead of being random (`FormatInterfaceMAC` in [cmd/utils.go](cmd/utils.go)): `02` for the outer end or `06` for the inner end, followed by the last 10 hex digits of the ID. For `vpce-0123456789abcdef0`, the inner end is `06:78:9a:bc:de:f0`. This makes them easy to spot in captures and stable across `remove`/`add`. Setting them explicitly also stops systemd-udevd's default `MACAddressPolicy=persistent` from replacing a random MAC after `add` has recorded it.
+3. **Disable offloads** on both ends: TX checksum offload and every segmentation and GRO offload (TSO, GSO, USO, GRO and so on; see `vethDisabledFeatures` in [cmd/add.go](cmd/add.go)). BPF can't compute the real L4 checksum, so the kernel has to write it before encap sees the packet. Every packet crossing the veth also has to be wire-sized, because encap would turn a GSO super-packet into one oversized frame that gets dropped.
+4. **Run `--script`**, if given, so the backend can finish its setup before the endpoint is reachable.
+5. **Go live.** Read both ends' MACs (only now, since the script may have changed the inner one), insert `ENI ID → (outer ifindex, inner MAC, outer MAC)` into `eni_to_ifindex`, and attach encap to the outer end. This is last because it's what makes the endpoint reachable.
+
+With `--no-netns`, step 1 is skipped and the inner end stays in the root netns with the same name. Nothing then keeps different endpoints' routing tables apart, which is why a dedicated netns is the default.
+
+### What `remove` and `teardown` do
+
+`remove <vpce-id>` ([cmd/remove.go](cmd/remove.go)) undoes `add` in this order:
+
+1. Delete the `eni_to_ifindex` entry.
+2. Detach encap.
+3. Delete the veth pair.
+4. Delete any `flow_state`, `frag_state` and `metrics` entries keyed by that ifindex, so a future endpoint that reuses the ifindex doesn't inherit them. This happens after the veth is gone because packets already in decap or encap can still write entries until then.
+5. Delete the netns.
+
+`teardown` ([cmd/teardown.go](cmd/teardown.go)) removes every provisioned endpoint, then detaches decap and deletes the pin directory.
+
+### BPF maps
+
+Maps are pinned by name, so both programs share the same instances.
+
+| Map | Purpose |
+|---|---|
+| `eni_to_ifindex` | ENI ID → outer veth ifindex and the L2 addresses decap writes. Sized by `--max-enis`. |
+| `flow_state` | Inner 5-tuple plus ifindex → cached outer header. One LRU hash for both IPv4 and IPv6 (`struct flow_key` has a family tag), sized by `--max-flows`. Old flows age out automatically. Sharing one map wastes less space than separate per-family maps, but a burst of one family's flows can evict the other's. |
+| `frag_state` | encap's tracking for fragmented replies: a first fragment's addresses, protocol and fragment ID → its flow's cached outer header. LRU with 16384 entries, since an entry only needs to outlive one datagram. |
+| `metrics` | Per-CPU packet and byte counters per (ifindex, counter). Read by `serve`. |
+
+### Load-time constants
+
+Some settings are written into each program's `.rodata` at `setup` and are fixed until the next `setup`, instead of being looked up per packet:
+
+- `eni_mode`: NAT/terminating (default) or transparent (`--transparent`), which sets how encap orients its lookups.
+- The uplink's ifindex, so encap can redirect replies without a map lookup.
+- `max_inner_len`, in both programs: uplink MTU minus 68, the largest inner packet decap delivers and encap sends.
+- `allowed_origin_addr` and `allowed_origin_mask`, from `--allowed-origin-cidr`.
 
 ### MTU and offloads
 
-GWLB's documented MTU is 8500 bytes of inner packet, but it doesn't hold what it delivers to that: it can send larger inner packets whole, and fragments a packet too large for it itself — so the fragments it creates can be larger than 8500 too. It never sends ICMP "fragmentation needed", so a DF-set reply larger than it will carry back is silently lost. That makes the two directions asymmetric:
+GWLB documents an MTU of 8500 bytes of inner packet but doesn't stick to it. It can deliver larger inner packets whole, and when it fragments a packet itself, the fragments can also exceed 8500. It never sends ICMP "fragmentation needed", so a DF-set reply larger than it will carry is lost silently. That makes the two directions different:
 
-- **Receiving: the uplink's MTU, minus 68.** decap delivers any inner packet one GENEVE packet on the uplink can carry, and `add` sets each ENI's veth MTU to the same value (8933 on a 9001-byte uplink), both taken from the uplink's MTU at `setup`/`add` time. Re-run `setup` (and re-add ENIs) if the uplink's MTU changes. `setup` warns below 8568, the least that carries GWLB's documented 8500-byte packets.
-- **Sending: a route MTU of 8500 in the netns.** The veth's interface MTU is too large for replies, so the netns's routes out of it need `mtu 8500` — set by `--script` alongside the routes themselves, e.g.
-
-  ```
-  ip -n "$1" route add default via <next hop> dev "$2" mtu 8500
-  ip -n "$1" route change <connected prefix> dev "$2" mtu 8500
-  ```
-
-  The kernel then picks a TCP MSS that fits (8460), fragments larger UDP datagrams itself (encap matches every fragment to its flow), and answers a forwarded DF-set packet that's too large with its own "fragmentation needed", which encap sends back to the sender. encap's own limit is only what the uplink can carry, so without the route MTU, replies of 8501–8933 bytes are encapsulated and left for GWLB to carry or lose.
-- **XDP mode.** At a jumbo MTU both ENA and veth refuse native XDP for programs like these (single-buffer, no `xdp.frags`), so both programs normally run as generic XDP — after GRO. Keep UDP GRO forwarding (`rx-udp-gro-forwarding`, `rx-gro-list`) off on the uplink, or GENEVE packets can reach decap merged into one; `setup` warns if either is on, and any that get through are counted as `decap_drop_oversize`.
+- **Receiving uses the uplink's MTU minus 68.** decap delivers any inner packet that fits in one GENEVE packet on the uplink, and `add` sets each veth's MTU to the same value (8933 on a 9001-byte uplink). Both are read from the uplink when `setup` and `add` run, so re-run `setup` and re-add endpoints if the uplink's MTU changes. `setup` warns if the MTU is below 8568, the minimum that carries GWLB's documented 8500-byte packets.
+- **Sending uses a route MTU of 8500.** With `mtu 8500` on the netns's routes (see [Configuring the backend netns](#configuring-the-backend-netns)), the kernel picks a TCP MSS that fits (8460), fragments larger UDP datagrams itself (encap matches every fragment to its flow), and answers a forwarded DF-set packet that's too large with its own "fragmentation needed", which encap sends back to the sender. encap only enforces what the uplink can carry, so without the route MTU, replies of 8501–8933 bytes are sent and left for GWLB to carry or drop.
+- **XDP runs in generic mode.** At a jumbo MTU, both ENA and veth refuse native XDP for single-buffer programs like these (no `xdp.frags`), so both programs normally run as generic XDP, after GRO. Keep UDP GRO forwarding (`rx-udp-gro-forwarding`, `rx-gro-list`) off on the uplink, or GENEVE packets can reach decap merged together. `setup` warns if either is on, and any merged packets that get through are counted as `decap_drop_oversize`.
