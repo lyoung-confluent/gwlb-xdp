@@ -200,6 +200,17 @@ func RunAdd(vpceID string, scriptPath string, isolated bool) (err error) {
 		return fmt.Errorf("(*netlink.Handle).LinkSetUp for %q failed: %w", innerName, err)
 	}
 
+	// No ARP/ND on the inner end: the kernel then gives every neighbor on it
+	// the interface's own MAC instead of resolving one (see arp_constructor
+	// and ndisc_constructor). Otherwise a reply would wait on resolving its
+	// next hop — which nothing answers, since the root netns only answers
+	// for its own addresses — even though encap replaces that MAC anyway.
+	// Nothing needs to resolve the inner end either: decap writes its MAC
+	// into every frame it delivers.
+	if err := nsh.LinkSetARPOff(inner); err != nil {
+		return fmt.Errorf("(*netlink.Handle).LinkSetARPOff for %q failed: %w", innerName, err)
+	}
+
 	// Disable TX checksum offload and every segmentation/GRO offload on both
 	// ends (see vethDisabledFeatures), before encap is attached.
 	if isolated {

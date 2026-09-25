@@ -83,7 +83,6 @@ const (
 
 	echoServerIP   = "192.0.2.10"
 	fakeClientIP   = "192.0.2.1"
-	fakeClientMAC  = "02:00:00:00:00:01"
 	echoServerPort = 17777
 	fakeClientPort = 54321
 
@@ -206,22 +205,21 @@ type eni struct {
 }
 
 // backendAddr describes one address family's worth of an ENI's backend: the
-// echo server's own address, the CIDR to assign it on veth-inner, the client
-// address to pin a permanent neighbor entry for, and the net.ListenUDP network
-// to serve on. provisionENI configures every ENI with both v4 and v6 so the
-// same backend answers either family (see TestEndToEnd vs TestEndToEndV6).
+// echo server's own address, the CIDR to assign it on veth-inner, and the
+// net.ListenUDP network to serve on. provisionENI configures every ENI with
+// both v4 and v6 so the same backend answers either family (see TestEndToEnd
+// vs TestEndToEndV6).
 type backendAddr struct {
-	network  string // "udp4" / "udp6", for net.ListenUDP
-	family   int    // netlink.FAMILY_V4 / netlink.FAMILY_V6, for the neighbor
-	cidr     string // echo address + prefix, e.g. "192.0.2.10/24"
-	echoIP   string
-	clientIP string
-	nodad    bool // skip IPv6 DAD so the address is usable immediately
+	network string // "udp4" / "udp6", for net.ListenUDP
+	family  int    // netlink.FAMILY_V4 / netlink.FAMILY_V6
+	cidr    string // echo address + prefix, e.g. "192.0.2.10/24"
+	echoIP  string
+	nodad   bool // skip IPv6 DAD so the address is usable immediately
 }
 
 var backendAddrs = []backendAddr{
-	{"udp4", netlink.FAMILY_V4, echoServerIP + "/24", echoServerIP, fakeClientIP, false},
-	{"udp6", netlink.FAMILY_V6, echoServerIP6 + "/64", echoServerIP6, fakeClientIP6, true},
+	{"udp4", netlink.FAMILY_V4, echoServerIP + "/24", echoServerIP, false},
+	{"udp6", netlink.FAMILY_V6, echoServerIP6 + "/64", echoServerIP6, true},
 }
 
 // provisionENI runs `add` for gwlbID — into a dedicated netns when isolated
@@ -235,18 +233,17 @@ var backendAddrs = []backendAddr{
 // Each family's connected route gets a route MTU of bpf.GWLBMTU, the way a
 // real deployment's --script would set its routes up (see README.md).
 //
-// Each family's client address gets a permanent (never-ARPed/never-NDP'd)
-// neighbor entry on the ENI's own veth-inner, mapped to clientMAC: nothing
-// will ever answer for it, so without this the echo server's reply would sit
-// in the kernel's neighbor queue forever instead of ever reaching encap.
-func provisionENI(t *testing.T, gwlbID uint64, isolated bool, echoPort int, clientMAC string, transform func([]byte) []byte) eni {
+// No neighbor entry is pinned for the client address, even though it's
+// on-link and nothing will ever answer ARP/ND for it: `add` turns ARP off on
+// veth-inner, so the echo server's reply needs none (see cmd/add.go).
+func provisionENI(t *testing.T, gwlbID uint64, isolated bool, echoPort int, transform func([]byte) []byte) eni {
 	t.Helper()
-	return provisionENIWithScript(t, gwlbID, isolated, "", echoPort, clientMAC, transform)
+	return provisionENIWithScript(t, gwlbID, isolated, "", echoPort, transform)
 }
 
 // provisionENIWithScript is provisionENI, passing scriptPath to `add` as its
 // --script.
-func provisionENIWithScript(t *testing.T, gwlbID uint64, isolated bool, scriptPath string, echoPort int, clientMAC string, transform func([]byte) []byte) eni {
+func provisionENIWithScript(t *testing.T, gwlbID uint64, isolated bool, scriptPath string, echoPort int, transform func([]byte) []byte) eni {
 	t.Helper()
 
 	vpceID := cmd.FormatVPCEID(gwlbID)
@@ -264,11 +261,6 @@ func provisionENIWithScript(t *testing.T, gwlbID uint64, isolated bool, scriptPa
 	outerIface, err := net.InterfaceByName(outerName)
 	if err != nil {
 		t.Fatalf("net.InterfaceByName(%q) failed: %v", outerName, err)
-	}
-
-	clientHW, err := net.ParseMAC(clientMAC)
-	if err != nil {
-		t.Fatalf("net.ParseMAC failed: %v", err)
 	}
 
 	// nlh is the netlink handle addressing the inner veth's netns (a dedicated
@@ -331,16 +323,6 @@ func provisionENIWithScript(t *testing.T, gwlbID uint64, isolated bool, scriptPa
 		}); err != nil {
 			t.Fatalf("(*netlink.Handle).RouteReplace for %q failed: %v", b.cidr, err)
 		}
-		if err := nlh.NeighAdd(&netlink.Neigh{
-			LinkIndex:    innerLink.Attrs().Index,
-			Family:       b.family,
-			State:        netlink.NUD_PERMANENT,
-			IP:           net.ParseIP(b.clientIP),
-			HardwareAddr: clientHW,
-		}); err != nil {
-			t.Fatalf("(*netlink.Handle).NeighAdd(%q) failed: %v", b.clientIP, err)
-		}
-
 		// The listening socket is created *inside* the netns via inNetns, but
 		// a socket's netns membership is fixed at creation time — the
 		// goroutine reading/writing it below runs in the root netns fine.
@@ -608,7 +590,7 @@ func TestEndToEnd(t *testing.T) {
 
 	uplinkIface, gwlbIface := setupUplink(t)
 	runSetup(t, 8)
-	one := provisionENI(t, gwlbID, true, echoServerPort, fakeClientMAC, func(b []byte) []byte { return b })
+	one := provisionENI(t, gwlbID, true, echoServerPort, func(b []byte) []byte { return b })
 	fd := openGWLBSocket(t, gwlbIface)
 
 	payload := []byte("hello from gwlb-xdp e2e test")
@@ -828,7 +810,7 @@ func TestOriginFiltering(t *testing.T) {
 			t.Errorf("cmd.RunTeardown failed: %v", err)
 		}
 	})
-	one := provisionENI(t, gwlbID, true, echoServerPort, fakeClientMAC, func(b []byte) []byte { return b })
+	one := provisionENI(t, gwlbID, true, echoServerPort, func(b []byte) []byte { return b })
 	fd := openGWLBSocket(t, gwlbIface)
 
 	payload := []byte("hello from the origin filtering test")
@@ -902,10 +884,10 @@ func TestOverlappingCIDRIsolation(t *testing.T) {
 	tag := func(prefix string) func([]byte) []byte {
 		return func(b []byte) []byte { return append([]byte(prefix), b...) }
 	}
-	// Same echoServerIP:echoServerPort, same fakeClientIP/MAC neighbor entry,
-	// for both ENIs — only their own netns keeps that from colliding.
-	eniA := provisionENI(t, gwlbIDA, true, echoServerPort, fakeClientMAC, tag("A:"))
-	eniB := provisionENI(t, gwlbIDB, true, echoServerPort, fakeClientMAC, tag("B:"))
+	// Same echoServerIP:echoServerPort and on-link fakeClientIP for both
+	// ENIs — only their own netns keeps that from colliding.
+	eniA := provisionENI(t, gwlbIDA, true, echoServerPort, tag("A:"))
+	eniB := provisionENI(t, gwlbIDB, true, echoServerPort, tag("B:"))
 	if eniA.outerIfindex == eniB.outerIfindex {
 		t.Fatalf("both ENIs resolved to the same veth-outer ifindex (%d) — test setup is broken", eniA.outerIfindex)
 	}
@@ -962,7 +944,7 @@ func TestNoNetns(t *testing.T) {
 
 	uplinkIface, gwlbIface := setupUplink(t)
 	runSetup(t, 8)
-	one := provisionENI(t, gwlbID, false, echoServerPort, fakeClientMAC, func(b []byte) []byte { return b })
+	one := provisionENI(t, gwlbID, false, echoServerPort, func(b []byte) []byte { return b })
 	fd := openGWLBSocket(t, gwlbIface)
 
 	// Confirm --no-netns actually took: no netns was created for this ENI
@@ -1025,7 +1007,7 @@ func TestICMPEcho(t *testing.T) {
 
 	uplinkIface, gwlbIface := setupUplink(t)
 	runSetup(t, 8)
-	one := provisionENI(t, gwlbID, true, echoServerPort, fakeClientMAC, func(b []byte) []byte { return b })
+	one := provisionENI(t, gwlbID, true, echoServerPort, func(b []byte) []byte { return b })
 	fd := openGWLBSocket(t, gwlbIface)
 
 	const icmpID, icmpSeq = 0x1234, 1
@@ -1137,7 +1119,7 @@ func TestEndToEndV6(t *testing.T) {
 
 	uplinkIface, gwlbIface := setupUplink(t)
 	runSetup(t, 8)
-	one := provisionENI(t, gwlbID, true, echoServerPort, fakeClientMAC, func(b []byte) []byte { return b })
+	one := provisionENI(t, gwlbID, true, echoServerPort, func(b []byte) []byte { return b })
 	fd := openGWLBSocket(t, gwlbIface)
 
 	payload := []byte("hello from gwlb-xdp e2e test (ipv6)")
@@ -1224,7 +1206,7 @@ func TestRemove(t *testing.T) {
 
 	uplinkIface, gwlbIface := setupUplink(t)
 	runSetup(t, 8)
-	one := provisionENI(t, gwlbID, true, echoServerPort, fakeClientMAC, func(b []byte) []byte { return b })
+	one := provisionENI(t, gwlbID, true, echoServerPort, func(b []byte) []byte { return b })
 	fd := openGWLBSocket(t, gwlbIface)
 
 	// Populate flow_state + metrics for this ENI's ifindex.

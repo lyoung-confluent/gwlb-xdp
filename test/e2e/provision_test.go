@@ -93,7 +93,7 @@ func TestAddAlreadyProvisioned(t *testing.T) {
 
 			uplinkIface, gwlbIface := setupUplink(t)
 			runSetup(t, 8)
-			one := provisionENI(t, gwlbID, isolated, echoServerPort, fakeClientMAC, func(b []byte) []byte { return b })
+			one := provisionENI(t, gwlbID, isolated, echoServerPort, func(b []byte) []byte { return b })
 			fd := openGWLBSocket(t, gwlbIface)
 
 			for _, again := range []bool{isolated, !isolated} {
@@ -145,7 +145,7 @@ func TestAddRollback(t *testing.T) {
 
 			uplinkIface, gwlbIface := setupUplink(t)
 			runSetup(t, 8)
-			provisionENI(t, bystanderID, true, echoServerPort, fakeClientMAC, func(b []byte) []byte { return b })
+			provisionENI(t, bystanderID, true, echoServerPort, func(b []byte) []byte { return b })
 			fd := openGWLBSocket(t, gwlbIface)
 			pinsBefore := encapPins(t)
 
@@ -189,7 +189,7 @@ func TestAddScriptSetsMAC(t *testing.T) {
 	uplinkIface, gwlbIface := setupUplink(t)
 	runSetup(t, 8)
 	script := writeScript(t, `exec ip -n "$1" link set dev "$2" address `+scriptMAC)
-	provisionENIWithScript(t, gwlbID, true, script, echoServerPort, fakeClientMAC, func(b []byte) []byte { return b })
+	provisionENIWithScript(t, gwlbID, true, script, echoServerPort, func(b []byte) []byte { return b })
 	fd := openGWLBSocket(t, gwlbIface)
 
 	info, err := decap.LookupENI(gwlbID)
