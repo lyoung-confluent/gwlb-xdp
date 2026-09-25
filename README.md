@@ -72,8 +72,6 @@ ip -n "$1" route change 10.0.0.0/24 dev "$2" mtu 8500
 ip -n "$1" route add default via 10.0.0.1 dev "$2" mtu 8500
 ```
 
-You don't need neighbor entries for the next hop. `add` turns ARP/ND off on the inner veth end (`IFF_NOARP`), so the netns sends replies right away without resolving anything. Scripts that still pin neighbor entries keep working.
-
 ### Health and metrics
 
 `serve` returns HTTP 200 only while decap is attached and the uplink is up with carrier.
