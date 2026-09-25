@@ -188,7 +188,7 @@ func TestAddScriptSetsMAC(t *testing.T) {
 
 	uplinkIface, gwlbIface := setupUplink(t)
 	runSetup(t, 8)
-	script := writeScript(t, `exec ip -n "$1" link set dev "$2" address `+scriptMAC)
+	script := writeScript(t, `exec ip link set dev "$2" address `+scriptMAC)
 	provisionEndpointWith(t, gwlbID, true, script, 0, echoServerPort, func(b []byte) []byte { return b })
 	fd := openGWLBSocket(t, gwlbIface)
 

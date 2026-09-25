@@ -37,7 +37,7 @@ var AddCmd = &cobra.Command{
 }
 
 func init() {
-	AddCmd.Flags().StringVar(&ScriptPath, "script", "", "run this executable after the veth (and netns, unless --no-netns) are up but before traffic can reach this endpoint (see above)")
+	AddCmd.Flags().StringVar(&ScriptPath, "script", "", "run this executable, inside the endpoint's own netns unless --no-netns, after the veth is up but before traffic can reach this endpoint (see above)")
 	AddCmd.Flags().BoolVar(&NoNetns, "no-netns", false, "keep this endpoint's veth pair in the root netns instead of a dedicated one — only safe when this endpoint's backend addressing doesn't overlap any other endpoint's on this box")
 	AddCmd.Flags().IntVar(&VethMTU, "mtu", 0, "MTU of this endpoint's veth pair, capping both what the backend sends and what it can receive; at most the uplink's MTU minus 68 (default 8500, GWLB's documented MTU, or the uplink's limit if that's smaller)")
 	RootCmd.AddCommand(AddCmd)
@@ -240,14 +240,26 @@ func RunAdd(vpceID string, scriptPath string, isolated bool, mtu int) (err error
 	}
 
 	// Last chance to finish backend setup before this endpoint is wired up and
-	// reachable below (see the --script flag).
+	// reachable below (see the --script flag). Runs inside the endpoint's own
+	// netns when isolated, so the script can address innerName directly
+	// instead of having to reach into the netns itself.
 	if scriptPath != "" {
-		cmd := exec.Command(scriptPath, vpceID, innerName)
-		cmd.Stdin = os.Stdin
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("(*exec.Cmd).Run for --script %q failed: %w", scriptPath, err)
+		runScript := func() error {
+			cmd := exec.Command(scriptPath, vpceID, innerName)
+			cmd.Stdin = os.Stdin
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			if err := cmd.Run(); err != nil {
+				return fmt.Errorf("(*exec.Cmd).Run for --script %q failed: %w", scriptPath, err)
+			}
+			return nil
+		}
+		if isolated {
+			if err := WithNetns(newns, runScript); err != nil {
+				return fmt.Errorf("WithNetns for %q failed: %w", vpceID, err)
+			}
+		} else if err := runScript(); err != nil {
+			return err
 		}
 	}
 
