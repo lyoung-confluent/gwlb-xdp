@@ -27,15 +27,15 @@ func init() {
 	RootCmd.AddCommand(RemoveCmd)
 }
 
-// RunRemove doesn't need to know whether the ENI was added with --no-netns:
+// RunRemove doesn't need to know whether the endpoint was added with --no-netns:
 // the outer veth is found by ifindex (from the BPF map, when present) or by
 // its name, which — unlike the netns it and its peer end up in — doesn't
 // depend on the mode.
 //
-// Teardown runs in the order that lets nothing repopulate what the ENI
+// Teardown runs in the order that lets nothing repopulate what the endpoint
 // cached: stop decap delivering to it, detach encap, delete the veth, and
 // only then sweep its flow_state/frag_state/metrics entries (see
-// decap.SweepENI).
+// decap.SweepEndpoint).
 func RunRemove(vpceID string) error {
 	gwlbID, err := ParseVPCEID(vpceID)
 	if err != nil {
@@ -45,7 +45,7 @@ func RunRemove(vpceID string) error {
 	vpceID = FormatVPCEID(gwlbID)
 
 	var errs []error
-	info, err := decap.RemoveENI(gwlbID)
+	info, err := decap.RemoveEndpoint(gwlbID)
 	if err != nil {
 		errs = append(errs, err)
 	}
@@ -78,12 +78,12 @@ func RunRemove(vpceID string) error {
 			}
 		}
 
-		if err := decap.SweepENI(uint32(ifindex)); err != nil {
-			errs = append(errs, fmt.Errorf("decap.SweepENI for ifindex %d failed: %w", ifindex, err))
+		if err := decap.SweepEndpoint(uint32(ifindex)); err != nil {
+			errs = append(errs, fmt.Errorf("decap.SweepEndpoint for ifindex %d failed: %w", ifindex, err))
 		}
 	}
 
-	// Best-effort: no netns exists at all for a --no-netns ENI, which
+	// Best-effort: no netns exists at all for a --no-netns endpoint, which
 	// netns.DeleteNamed reports as os.ErrNotExist — not an error here.
 	if err := netns.DeleteNamed(vpceID); err != nil && !errors.Is(err, os.ErrNotExist) {
 		errs = append(errs, fmt.Errorf("netns.DeleteNamed for %q failed: %w", vpceID, err))

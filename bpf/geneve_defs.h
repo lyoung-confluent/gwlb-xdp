@@ -32,17 +32,17 @@ struct geneve_opt_hdr {
  * the aws-gateway-load-balancer-tunnel-handler reference (GenevePacket.cpp):
  * all three are mandatory on every GWLB packet and fixed-length.
  *
- *   type 0x01  ENI ID        8 bytes (__be64)
+ *   type 0x01  VPC endpoint ID        8 bytes (__be64)
  *   type 0x02  Attachment ID 8 bytes (__be64)
  *   type 0x03  Flow cookie   4 bytes (__be32)
  */
 #define GENEVE_OPT_CLASS_AWS		0x0108
 
-#define GWLB_OPT_TYPE_ENI		0x01
+#define GWLB_OPT_TYPE_VPCE		0x01
 #define GWLB_OPT_TYPE_ATTACHMENT	0x02
 #define GWLB_OPT_TYPE_COOKIE		0x03
 
-#define GWLB_OPT_ENI_LEN		8
+#define GWLB_OPT_VPCE_LEN		8
 #define GWLB_OPT_ATTACHMENT_LEN		8
 #define GWLB_OPT_COOKIE_LEN		4
 
@@ -54,7 +54,7 @@ struct geneve_opt_hdr {
  */
 #define GWLB_OPTS_LEN ( \
 	3 * sizeof(struct geneve_opt_hdr) + \
-	GWLB_OPT_ENI_LEN + GWLB_OPT_ATTACHMENT_LEN + GWLB_OPT_COOKIE_LEN)
+	GWLB_OPT_VPCE_LEN + GWLB_OPT_ATTACHMENT_LEN + GWLB_OPT_COOKIE_LEN)
 
 #define GENEVE_PORT			6081
 
@@ -393,7 +393,7 @@ static __always_inline bool icmp_is_quoting_error(bool is_v6, const struct inner
 }
 
 /* Whether t is an MLD or Neighbor Discovery message (or one of the other
- * link-local ICMPv6 control types between them): traffic between the ENI's
+ * link-local ICMPv6 control types between them): traffic between the endpoint's
  * netns and its veth, never a reply to anything decap delivered. */
 static __always_inline bool icmpv6_is_link_local_control(const struct inner_tuple *t)
 {

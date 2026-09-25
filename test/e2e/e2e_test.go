@@ -30,7 +30,7 @@ func flowStateCount(t *testing.T) int {
 }
 
 // flowStateCountFor returns how many live flow_state entries are keyed by
-// ifindex — used to assert `remove` sweeps exactly one ENI's cached flows
+// ifindex — used to assert `remove` sweeps exactly one endpoint's cached flows
 // (see TestRemove).
 func flowStateCountFor(t *testing.T, ifindex uint32) int {
 	t.Helper()
@@ -74,7 +74,7 @@ func flowStateIfindexes(t *testing.T) []uint32 {
 //	                              gwlbIfName plays the GWLB itself, sending
 //	                              the synthetic GENEVE request and capturing
 //	                              the reply over a raw socket.
-//	(created by cmd.RunAdd)       simulates one ENI's veth pair; its netns
+//	(created by cmd.RunAdd)       simulates one endpoint's veth pair; its netns
 //	                              side runs a real UDP echo server standing
 //	                              in for the appliance/backend.
 const (
@@ -87,7 +87,7 @@ const (
 	fakeClientPort = 54321
 
 	// IPv6 counterparts, for the inner-IPv6 data path (TestEndToEndV6).
-	// provisionENI configures these alongside the v4 addressing on every ENI,
+	// provisionEndpoint configures these alongside the v4 addressing on every endpoint,
 	// so the same backend answers both families.
 	echoServerIP6 = "2001:db8::10"
 	fakeClientIP6 = "2001:db8::1"
@@ -102,7 +102,7 @@ const (
 	fakeAttachmentID = 0
 	fakeFlowCookie   = 0x11223344
 
-	unknownGWLBID = 0xBAD // never provisioned — see the "unknown ENI" subtest
+	unknownGWLBID = 0xBAD // never provisioned — see the "unknown endpoint" subtest
 )
 
 func htons(v uint16) uint16 { return v<<8 | v>>8 }
@@ -158,9 +158,9 @@ func setupUplink(t *testing.T) (uplinkIface, gwlbIface *net.Interface) {
 
 // runSetup runs `setup` against uplinkIfName, exactly as the CLI itself
 // would, and registers `teardown` to reverse it.
-func runSetup(t *testing.T, maxENIs uint32) {
+func runSetup(t *testing.T, maxEndpoints uint32) {
 	t.Helper()
-	if err := cmd.RunSetup(uplinkIfName, maxENIs, 64, false, ""); err != nil {
+	if err := cmd.RunSetup(uplinkIfName, maxEndpoints, 64, false, ""); err != nil {
 		t.Fatalf("cmd.RunSetup failed: %v", err)
 	}
 	t.Cleanup(func() {
@@ -196,17 +196,17 @@ func openGWLBSocket(t *testing.T, gwlbIface *net.Interface) int {
 	return fd
 }
 
-// eni holds what tests need in order to address one provisioned ENI: its
+// endpoint holds what tests need in order to address one provisioned endpoint: its
 // GWLB-visible ID and the ifindex decap_ok/encap_ok metrics are keyed by
-// (its veth-outer, in the root netns — see the comment inside provisionENI).
-type eni struct {
+// (its veth-outer, in the root netns — see the comment inside provisionEndpoint).
+type endpoint struct {
 	gwlbID       uint64
 	outerIfindex uint32
 }
 
-// backendAddr describes one address family's worth of an ENI's backend: the
+// backendAddr describes one address family's worth of an endpoint's backend: the
 // echo server's own address, the CIDR to assign it on veth-inner, and the
-// net.ListenUDP network to serve on. provisionENI configures every ENI with
+// net.ListenUDP network to serve on. provisionEndpoint configures every endpoint with
 // both v4 and v6 so the same backend answers either family (see TestEndToEnd
 // vs TestEndToEndV6).
 type backendAddr struct {
@@ -222,12 +222,12 @@ var backendAddrs = []backendAddr{
 	{"udp6", netlink.FAMILY_V6, echoServerIP6 + "/64", echoServerIP6, true},
 }
 
-// provisionENI runs `add` for gwlbID — into a dedicated netns when isolated
+// provisionEndpoint runs `add` for gwlbID — into a dedicated netns when isolated
 // is true (the normal case), or leaving its veth pair in the root netns
 // (--no-netns) when false — and starts a real UDP echo server (one per address
 // family, see backendAddrs) on its veth-inner at echoPort, standing in for the
 // backend/appliance. Each received datagram's payload is passed through
-// transform before being echoed back, so a test can tell which ENI's backend
+// transform before being echoed back, so a test can tell which endpoint's backend
 // actually answered — pass bytes.Clone (or similar) for a plain echo.
 //
 // The veth pair gets add's default MTU (bpf.GWLBMTU), so the backend's own
@@ -236,14 +236,14 @@ var backendAddrs = []backendAddr{
 // No neighbor entry is pinned for the client address, even though it's
 // on-link and nothing will ever answer ARP/ND for it: `add` turns ARP off on
 // veth-inner, so the echo server's reply needs none (see cmd/add.go).
-func provisionENI(t *testing.T, gwlbID uint64, isolated bool, echoPort int, transform func([]byte) []byte) eni {
+func provisionEndpoint(t *testing.T, gwlbID uint64, isolated bool, echoPort int, transform func([]byte) []byte) endpoint {
 	t.Helper()
-	return provisionENIWith(t, gwlbID, isolated, "", 0, echoPort, transform)
+	return provisionEndpointWith(t, gwlbID, isolated, "", 0, echoPort, transform)
 }
 
-// provisionENIWith is provisionENI, passing scriptPath to `add` as its
+// provisionEndpointWith is provisionEndpoint, passing scriptPath to `add` as its
 // --script and mtu as its --mtu (0 for the default).
-func provisionENIWith(t *testing.T, gwlbID uint64, isolated bool, scriptPath string, mtu int, echoPort int, transform func([]byte) []byte) eni {
+func provisionEndpointWith(t *testing.T, gwlbID uint64, isolated bool, scriptPath string, mtu int, echoPort int, transform func([]byte) []byte) endpoint {
 	t.Helper()
 
 	vpceID := cmd.FormatVPCEID(gwlbID)
@@ -253,9 +253,9 @@ func provisionENIWith(t *testing.T, gwlbID uint64, isolated bool, scriptPath str
 
 	// The veth-outer end never leaves the root netns, isolated or not (see
 	// cmd/add.go) — this lookup always runs there. Its ifindex is what
-	// decap_ok/encap_ok are keyed by (both are post-ENI-resolution
+	// decap_ok/encap_ok are keyed by (both are post-endpoint-resolution
 	// counters — see _decap.c/_encap.c), as opposed to the uplink's own
-	// ifindex the pre-ENI drop counters use.
+	// ifindex the pre-endpoint drop counters use.
 	outerName := cmd.FormatInterfaceName(gwlbID, false)
 	innerName := cmd.FormatInterfaceName(gwlbID, true)
 	outerIface, err := net.InterfaceByName(outerName)
@@ -336,7 +336,7 @@ func provisionENIWith(t *testing.T, gwlbID uint64, isolated bool, scriptPath str
 		})
 	}
 
-	return eni{gwlbID: gwlbID, outerIfindex: uint32(outerIface.Index)}
+	return endpoint{gwlbID: gwlbID, outerIfindex: uint32(outerIface.Index)}
 }
 
 // metricSum returns counterName's summed per-CPU value for ifindex — 0 if
@@ -526,9 +526,9 @@ func assertValidReply(t *testing.T, reply *replyPacket, gwlbIface *net.Interface
 }
 
 // assertOKMetrics checks that decap/encap incremented exactly the "ok"
-// counters for one request/reply exchange, on the ENI's own veth-outer
+// counters for one request/reply exchange, on the endpoint's own veth-outer
 // ifindex — see increment_metric in bpf/maps.h and the comment on
-// provisionENI's outerIface lookup. reqFrameLen is the request frame's own
+// provisionEndpoint's outerIface lookup. reqFrameLen is the request frame's own
 // length (decap_ok_bytes' basis) and payloadLen is the echoed payload's
 // length (part of encap_ok_bytes' basis).
 func assertOKMetrics(t *testing.T, outerIfindex uint32, reqFrameLen, payloadLen int) {
@@ -556,7 +556,7 @@ func assertOKMetrics(t *testing.T, outerIfindex uint32, reqFrameLen, payloadLen 
 // TestEndToEnd drives decap and encap together, without a real GWLB: it
 // synthesizes an AWS GWLB GENEVE packet and sends it into a veth playing the
 // uplink's role, lets decap/encap and a real UDP echo server (running in the
-// ENI's own netns, standing in for the backend/appliance) carry it end to
+// endpoint's own netns, standing in for the backend/appliance) carry it end to
 // end, and checks the GENEVE reply that comes back out the same veth — plus
 // the metrics that exchange should have moved, and four ways a bad packet is
 // supposed to be dropped rather than answered.
@@ -573,7 +573,7 @@ func TestEndToEnd(t *testing.T) {
 
 	uplinkIface, gwlbIface := setupUplink(t)
 	runSetup(t, 8)
-	one := provisionENI(t, gwlbID, true, echoServerPort, func(b []byte) []byte { return b })
+	one := provisionEndpoint(t, gwlbID, true, echoServerPort, func(b []byte) []byte { return b })
 	fd := openGWLBSocket(t, gwlbIface)
 
 	payload := []byte("hello from gwlb-xdp e2e test")
@@ -590,11 +590,11 @@ func TestEndToEnd(t *testing.T) {
 	assertValidReply(t, reply, gwlbIface, reqOpts, payload)
 	assertOKMetrics(t, one.outerIfindex, len(reqFrame), len(payload))
 
-	// 8. Negative paths: decap should drop, not answer, a packet for an ENI
+	// 8. Negative paths: decap should drop, not answer, a packet for an endpoint
 	// it never provisioned or one that fails its own structural checks —
-	// each keyed by the *uplink's* ifindex, since these are pre-ENI-lookup
+	// each keyed by the *uplink's* ifindex, since these are pre-endpoint-lookup
 	// events (see ingress_ifindex's use in _decap.c).
-	t.Run("unknown ENI is dropped", func(t *testing.T) {
+	t.Run("unknown endpoint is dropped", func(t *testing.T) {
 		badOpts := buildGeneveOptions(unknownGWLBID, fakeAttachmentID, fakeFlowCookie)
 		badFrame, err := buildRequestFrame(requestParams{
 			outerSrcMAC:  gwlbIface.HardwareAddr,
@@ -617,13 +617,13 @@ func TestEndToEnd(t *testing.T) {
 			t.Fatalf("unix.Sendto failed: %v", err)
 		}
 		if reply := waitForReply(t, fd, uplinkIface.HardwareAddr, 2*time.Second); reply != nil {
-			t.Fatalf("got a GENEVE reply for an unprovisioned ENI ID, want none: %+v", reply)
+			t.Fatalf("got a GENEVE reply for an unprovisioned VPC endpoint ID, want none: %+v", reply)
 		}
-		if got := metricSum(t, "decap_drop_unknown_eni_packets", uint32(uplinkIface.Index)); got != 1 {
-			t.Errorf("decap_drop_unknown_eni_packets[uplink ifindex] = %d, want 1", got)
+		if got := metricSum(t, "decap_drop_unknown_endpoint_packets", uint32(uplinkIface.Index)); got != 1 {
+			t.Errorf("decap_drop_unknown_endpoint_packets[uplink ifindex] = %d, want 1", got)
 		}
-		if got := metricSum(t, "decap_drop_unknown_eni_bytes", uint32(uplinkIface.Index)); got != uint64(len(badFrame)) {
-			t.Errorf("decap_drop_unknown_eni_bytes[uplink ifindex] = %d, want %d", got, len(badFrame))
+		if got := metricSum(t, "decap_drop_unknown_endpoint_bytes", uint32(uplinkIface.Index)); got != uint64(len(badFrame)) {
+			t.Errorf("decap_drop_unknown_endpoint_bytes[uplink ifindex] = %d, want %d", got, len(badFrame))
 		}
 	})
 
@@ -775,7 +775,7 @@ func TestEndToEnd(t *testing.T) {
 // AllowedOriginCIDR, wired from cmd.RunSetup — see cmd/setup.go): a request
 // whose outer source IP falls inside the configured CIDR should be answered
 // exactly as if filtering were off, and one from outside it should be
-// dropped and counted, never reaching decap's ENI lookup — same pre-ENI,
+// dropped and counted, never reaching decap's endpoint lookup — same pre-endpoint,
 // uplink-ifindex-keyed shape as the other TestEndToEnd negative subtests.
 func TestOriginFiltering(t *testing.T) {
 	requireRoot(t)
@@ -793,7 +793,7 @@ func TestOriginFiltering(t *testing.T) {
 			t.Errorf("cmd.RunTeardown failed: %v", err)
 		}
 	})
-	one := provisionENI(t, gwlbID, true, echoServerPort, func(b []byte) []byte { return b })
+	one := provisionEndpoint(t, gwlbID, true, echoServerPort, func(b []byte) []byte { return b })
 	fd := openGWLBSocket(t, gwlbIface)
 
 	payload := []byte("hello from the origin filtering test")
@@ -841,14 +841,13 @@ func TestOriginFiltering(t *testing.T) {
 	})
 }
 
-// TestOverlappingCIDRIsolation provisions two ENIs (two distinct VPC
-// endpoints) whose backends deliberately reuse the exact same address —
-// something README.md calls out as only safe because each isolated ENI gets
-// its own netns; nothing then keeps two --no-netns ENIs' routing tables
+// TestOverlappingCIDRIsolation provisions two VPC endpoints whose backends
+// deliberately reuse the exact same address — something README.md calls out
+// as only safe because each isolated endpoint gets its own netns; nothing then keeps two --no-netns endpoints' routing tables
 // apart if their backend addressing overlaps. It sends a request to each
 // with an otherwise byte-identical inner 5-tuple (same client, same backend
-// address and port — only the GENEVE ENI ID differs) and checks that each
-// reply actually came from its own ENI's backend, not the other one's —
+// address and port — only the GENEVE VPC endpoint ID differs) and checks that each
+// reply actually came from its own endpoint's backend, not the other one's —
 // proof that ifindex, folded into decap/encap's flow_state key (see
 // bpf/geneve_defs.h), is really what keeps the two apart, not something
 // coincidental about the addressing.
@@ -868,56 +867,56 @@ func TestOverlappingCIDRIsolation(t *testing.T) {
 		return func(b []byte) []byte { return append([]byte(prefix), b...) }
 	}
 	// Same echoServerIP:echoServerPort and on-link fakeClientIP for both
-	// ENIs — only their own netns keeps that from colliding.
-	eniA := provisionENI(t, gwlbIDA, true, echoServerPort, tag("A:"))
-	eniB := provisionENI(t, gwlbIDB, true, echoServerPort, tag("B:"))
-	if eniA.outerIfindex == eniB.outerIfindex {
-		t.Fatalf("both ENIs resolved to the same veth-outer ifindex (%d) — test setup is broken", eniA.outerIfindex)
+	// endpoints — only their own netns keeps that from colliding.
+	endpointA := provisionEndpoint(t, gwlbIDA, true, echoServerPort, tag("A:"))
+	endpointB := provisionEndpoint(t, gwlbIDB, true, echoServerPort, tag("B:"))
+	if endpointA.outerIfindex == endpointB.outerIfindex {
+		t.Fatalf("both endpoints resolved to the same veth-outer ifindex (%d) — test setup is broken", endpointA.outerIfindex)
 	}
 
 	sendGENEVE(t, fd, uplinkIface, gwlbIface, gwlbIDA, []byte("hello"))
 	replyA := waitForReply(t, fd, uplinkIface.HardwareAddr, 5*time.Second)
 	if replyA == nil {
-		t.Fatal("no GENEVE reply observed for ENI A within 5s")
+		t.Fatal("no GENEVE reply observed for endpoint A within 5s")
 	}
 
 	// Identical inner tuple to A's request above — the only thing that
-	// tells decap/encap these are two different tenants is the GENEVE ENI
-	// ID (for decap's ENI lookup) and, from there on, the ifindex it maps
+	// tells decap/encap these are two different tenants is the GENEVE endpoint
+	// ID (for decap's endpoint lookup) and, from there on, the ifindex it maps
 	// to (for both programs' flow_state key).
 	sendGENEVE(t, fd, uplinkIface, gwlbIface, gwlbIDB, []byte("hello"))
 	replyB := waitForReply(t, fd, uplinkIface.HardwareAddr, 5*time.Second)
 	if replyB == nil {
-		t.Fatal("no GENEVE reply observed for ENI B within 5s")
+		t.Fatal("no GENEVE reply observed for endpoint B within 5s")
 	}
 
 	if got, want := string(replyA.payload), "A:hello"; got != want {
-		t.Errorf("ENI A reply payload = %q, want %q (answered by the wrong backend?)", got, want)
+		t.Errorf("endpoint A reply payload = %q, want %q (answered by the wrong backend?)", got, want)
 	}
 	if got, want := string(replyB.payload), "B:hello"; got != want {
-		t.Errorf("ENI B reply payload = %q, want %q (answered by the wrong backend?)", got, want)
+		t.Errorf("endpoint B reply payload = %q, want %q (answered by the wrong backend?)", got, want)
 	}
 
-	// And not just the payload: each ENI's own ifindex should show exactly
+	// And not just the payload: each endpoint's own ifindex should show exactly
 	// its own round trip in decap/encap's metrics, confirming the isolation
 	// holds at the flow_state/metrics layer too, not only in what the
 	// backends happened to reply with.
-	for _, e := range [...]eni{eniA, eniB} {
+	for _, e := range [...]endpoint{endpointA, endpointB} {
 		if got := metricSum(t, "decap_ok_packets", e.outerIfindex); got != 1 {
-			t.Errorf("decap_ok_packets[ifindex %d, ENI %#x] = %d, want 1", e.outerIfindex, e.gwlbID, got)
+			t.Errorf("decap_ok_packets[ifindex %d, endpoint %#x] = %d, want 1", e.outerIfindex, e.gwlbID, got)
 		}
 		if got := metricSum(t, "encap_ok_packets", e.outerIfindex); got != 1 {
-			t.Errorf("encap_ok_packets[ifindex %d, ENI %#x] = %d, want 1", e.outerIfindex, e.gwlbID, got)
+			t.Errorf("encap_ok_packets[ifindex %d, endpoint %#x] = %d, want 1", e.outerIfindex, e.gwlbID, got)
 		}
 	}
 }
 
 // TestNoNetns is TestEndToEnd's happy path run through `add --no-netns`
-// instead: both ends of the ENI's veth pair stay in the root netns (see
+// instead: both ends of the endpoint's veth pair stay in the root netns (see
 // cmd.RunAdd's isolated parameter and README.md's note on --no-netns),
-// rather than a dedicated one — the whole reason provisionENI takes an
+// rather than a dedicated one — the whole reason provisionEndpoint takes an
 // isolated flag. Nothing here should differ from the isolated case except
-// where the ENI's own interfaces live; decap/encap don't know or care
+// where the endpoint's own interfaces live; decap/encap don't know or care
 // either way.
 func TestNoNetns(t *testing.T) {
 	requireRoot(t)
@@ -927,10 +926,10 @@ func TestNoNetns(t *testing.T) {
 
 	uplinkIface, gwlbIface := setupUplink(t)
 	runSetup(t, 8)
-	one := provisionENI(t, gwlbID, false, echoServerPort, func(b []byte) []byte { return b })
+	one := provisionEndpoint(t, gwlbID, false, echoServerPort, func(b []byte) []byte { return b })
 	fd := openGWLBSocket(t, gwlbIface)
 
-	// Confirm --no-netns actually took: no netns was created for this ENI
+	// Confirm --no-netns actually took: no netns was created for this endpoint
 	// at all (as opposed to, say, the round trip below happening to work
 	// even if isolated were silently ignored somewhere).
 	vpceID := cmd.FormatVPCEID(gwlbID)
@@ -939,7 +938,7 @@ func TestNoNetns(t *testing.T) {
 		t.Fatalf("a netns named %q exists, want none — --no-netns should never create one", vpceID)
 	}
 
-	// Both veth ends got their ENI-derived MAC (see cmd.FormatInterfaceMAC),
+	// Both veth ends got their endpoint-derived MAC (see cmd.FormatInterfaceMAC),
 	// explicitly assigned (NET_ADDR_SET, 3) rather than kernel-random
 	// (NET_ADDR_RANDOM, 1), which systemd-udevd could replace after decap
 	// cached it — see RunAdd. With --no-netns both ends are in this netns,
@@ -977,10 +976,10 @@ func TestNoNetns(t *testing.T) {
 // TestICMPEcho drives an ICMP echo request through decap and back through
 // encap as an echo reply — decap/encap's ICMP support (parse_l4 in
 // bpf/geneve_defs.h) keys the flow by the echo's own id, the same way a
-// TCP/UDP flow is keyed by port. Nothing needs to run in the ENI's netns to
+// TCP/UDP flow is keyed by port. Nothing needs to run in the endpoint's netns to
 // answer the ping: the kernel replies on its own to an echo request
 // addressed to any of its interfaces' own IPs, which is exactly what
-// provisionENI's AddrAdd gives echoServerIP — so this needs no echo server,
+// provisionEndpoint's AddrAdd gives echoServerIP — so this needs no echo server,
 // unlike TestEndToEnd's UDP round trip.
 func TestICMPEcho(t *testing.T) {
 	requireRoot(t)
@@ -990,7 +989,7 @@ func TestICMPEcho(t *testing.T) {
 
 	uplinkIface, gwlbIface := setupUplink(t)
 	runSetup(t, 8)
-	one := provisionENI(t, gwlbID, true, echoServerPort, func(b []byte) []byte { return b })
+	one := provisionEndpoint(t, gwlbID, true, echoServerPort, func(b []byte) []byte { return b })
 	fd := openGWLBSocket(t, gwlbIface)
 
 	const icmpID, icmpSeq = 0x1234, 1
@@ -1102,7 +1101,7 @@ func TestEndToEndV6(t *testing.T) {
 
 	uplinkIface, gwlbIface := setupUplink(t)
 	runSetup(t, 8)
-	one := provisionENI(t, gwlbID, true, echoServerPort, func(b []byte) []byte { return b })
+	one := provisionEndpoint(t, gwlbID, true, echoServerPort, func(b []byte) []byte { return b })
 	fd := openGWLBSocket(t, gwlbIface)
 
 	payload := []byte("hello from gwlb-xdp e2e test (ipv6)")
@@ -1173,12 +1172,12 @@ func TestEndToEndV6(t *testing.T) {
 	}
 }
 
-// TestRemove drives one ENI through a full round trip (so its flow_state cache
+// TestRemove drives one endpoint through a full round trip (so its flow_state cache
 // and metrics rows are populated), then `remove`s it and checks that every
-// piece is actually reversed: the eni_to_ifindex entry, the veth pair, the
-// netns, and — the part remove exists to guarantee (see decap.SweepENI) — the
+// piece is actually reversed: the vpce_to_ifindex entry, the veth pair, the
+// netns, and — the part remove exists to guarantee (see decap.SweepEndpoint) — the
 // flow_state and metrics entries keyed by the now-freed ifindex, so a later
-// ENI recycling that ifindex can't inherit stale cache hits or counters.
+// endpoint recycling that ifindex can't inherit stale cache hits or counters.
 func TestRemove(t *testing.T) {
 	requireRoot(t)
 	_ = unix.Mount("bpf", "/sys/fs/bpf", "bpf", 0, "")
@@ -1189,10 +1188,10 @@ func TestRemove(t *testing.T) {
 
 	uplinkIface, gwlbIface := setupUplink(t)
 	runSetup(t, 8)
-	one := provisionENI(t, gwlbID, true, echoServerPort, func(b []byte) []byte { return b })
+	one := provisionEndpoint(t, gwlbID, true, echoServerPort, func(b []byte) []byte { return b })
 	fd := openGWLBSocket(t, gwlbIface)
 
-	// Populate flow_state + metrics for this ENI's ifindex.
+	// Populate flow_state + metrics for this endpoint's ifindex.
 	sendGENEVE(t, fd, uplinkIface, gwlbIface, gwlbID, []byte("populate"))
 	if reply := waitForReply(t, fd, uplinkIface.HardwareAddr, 5*time.Second); reply == nil {
 		t.Fatal("no reply before remove — round trip is broken, nothing to test removal against")
@@ -1226,14 +1225,14 @@ func TestRemove(t *testing.T) {
 		t.Fatalf("cmd.RunRemove(%q) failed: %v", vpceID, err)
 	}
 
-	// eni_to_ifindex entry gone.
-	ids, err := decap.ProvisionedENIs()
+	// vpce_to_ifindex entry gone.
+	ids, err := decap.ProvisionedEndpoints()
 	if err != nil {
-		t.Fatalf("decap.ProvisionedENIs failed: %v", err)
+		t.Fatalf("decap.ProvisionedEndpoints failed: %v", err)
 	}
 	for _, id := range ids {
 		if id == gwlbID {
-			t.Errorf("ENI %#x still in eni_to_ifindex after remove", gwlbID)
+			t.Errorf("endpoint %#x still in vpce_to_ifindex after remove", gwlbID)
 		}
 	}
 
@@ -1249,7 +1248,7 @@ func TestRemove(t *testing.T) {
 	}
 
 	// flow_state swept — the whole point of remove's sweep (see
-	// decap.SweepENI) — and nothing else's entries with it.
+	// decap.SweepEndpoint) — and nothing else's entries with it.
 	if n := flowStateCountFor(t, one.outerIfindex); n != 0 {
 		t.Errorf("flow_state not swept after remove: %d entries for the freed ifindex, want 0", n)
 	}

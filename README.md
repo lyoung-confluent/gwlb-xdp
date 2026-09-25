@@ -6,7 +6,7 @@ A proof of concept that uses XDP/eBPF to terminate GENEVE traffic from an [AWS G
 
 `gwlb-xdp` is a CLI that loads two XDP programs into the kernel, wires them up, and exits. There is no userspace process on the packet path. The programs and their shared maps are pinned under `/sys/fs/bpf/gwlb-xdp`, so they keep running after the CLI exits and later commands can find them.
 
-- **decap** runs on the physical uplink. It receives GENEVE packets from GWLB, reads the ENI ID that GWLB puts in the GENEVE options, strips the outer headers, and redirects the inner packet to that VPC endpoint's veth pair. It also caches the outer header so the reply can reuse it.
+- **decap** runs on the physical uplink. It receives GENEVE packets from GWLB, reads the VPC endpoint ID that GWLB puts in the GENEVE options, strips the outer headers, and redirects the inner packet to that VPC endpoint's veth pair. It also caches the outer header so the reply can reuse it.
 - **encap** runs on each VPC endpoint's veth. When the backend replies, encap finds the cached outer header for that flow, puts it back on the packet, and sends the packet back out the uplink to GWLB.
 
 ```
@@ -53,7 +53,7 @@ gwlb-xdp setup --allowed-origin-cidr <cidr> [flags] <uplink-ifname>
 Loads decap and encap and attaches decap to the uplink interface.
 
 - `--allowed-origin-cidr` *(required)*: only accept GENEVE packets whose outer source IPv4 address is in this CIDR (the GWLB's subnet). It's required so that accepting all traffic is an explicit choice. Without it, anyone who can reach UDP 6081 could inject packets into an endpoint's netns or hijack a flow's replies. If AWS security groups already restrict who can reach UDP 6081 on this host, you can set it to `0.0.0.0/0` and let the security group do the filtering.
-- `--max-enis` (default `128`): maximum number of VPC endpoints on this host.
+- `--max-endpoints` (default `128`): maximum number of VPC endpoints on this host.
 - `--max-flows` (default `1048576`): maximum number of tracked flows, IPv4 and IPv6 combined.
 - `--transparent` (default `false`): treat every endpoint as a transparent appliance, so replies keep the request's 5-tuple rather than swapping it. Usually needs a larger `add --mtu`; see [MTU and offloads](#mtu-and-offloads).
 
@@ -108,7 +108,7 @@ Serves an HTTP health endpoint and optionally pushes counters to statsd. It retu
 - `--interval` (default `0`): how often to push counters to statsd. `0` disables pushing, leaving just the health endpoint.
 - `--statsd` (default `127.0.0.1:8125`): the statsd endpoint to push to, typically the local CloudWatch agent.
 
-With `--interval` set, `serve` reads the per-interface packet and byte counters and pushes how much each grew since the last sample to statsd as counters (`|c`). They're tagged with `interface` and, for endpoints, `gwlb_id` (the lowercase VPC endpoint ID). Byte counters count full encapsulated frames as they cross the uplink, in both directions. Datagrams are at most 1432 bytes.
+With `--interval` set, `serve` reads the per-interface packet and byte counters and pushes how much each grew since the last sample to statsd as counters (`|c`). They're tagged with `interface` and, for VPC endpoints, `gwlb_id` (the lowercase VPC endpoint ID). Byte counters count full encapsulated frames as they cross the uplink, in both directions. Datagrams are at most 1432 bytes.
 
 ## Building and testing
 
@@ -148,7 +148,7 @@ The rest of this document covers the datapath in detail.
 ### Code layout
 
 - [main.go](main.go) and [cmd/](cmd): the CLI.
-- [bpf/decap/_decap.c](bpf/decap/_decap.c): the decap XDP program and the `eni_to_ifindex` map.
+- [bpf/decap/_decap.c](bpf/decap/_decap.c): the decap XDP program and the `vpce_to_ifindex` map.
 - [bpf/encap/_encap.c](bpf/encap/_encap.c): the encap XDP program and the `frag_state` map.
 - [bpf/maps.h](bpf/maps.h): the shared `flow_state` and `metrics` maps.
 - [bpf/maps.go](bpf/maps.go): map pinning under `/sys/fs/bpf/gwlb-xdp`.
@@ -158,8 +158,8 @@ The rest of this document covers the datapath in detail.
 decap is attached once to the uplink by `setup`. For each GENEVE/UDP packet it:
 
 1. Drops the packet if its outer source isn't in `--allowed-origin-cidr`, counting it in `decap_drop_origin_not_allowed_{packets,bytes}`.
-2. Parses GWLB's GENEVE options. GWLB always sends the same three options in the same order and at the same length (ENI ID, attachment ID, flow cookie), so no options loop is needed.
-3. Looks up the ENI ID in `eni_to_ifindex` to find the endpoint's veth.
+2. Parses GWLB's GENEVE options. GWLB always sends the same three options in the same order and at the same length (VPC endpoint ID, attachment ID, flow cookie), so no options loop is needed.
+3. Looks up the VPC endpoint ID in `vpce_to_ifindex` to find the endpoint's veth.
 4. Caches the outer header in `flow_state`, keyed by the inner packet's 5-tuple plus the veth's ifindex. The cached copy is already in reply form: Ethernet and IP addresses are swapped, and TTL, ECN, DF and IP ID are set to what a new reply should carry (TTL 64, Not-ECT, DF, ID 0) instead of being copied from the request. The entry is only rewritten when the flow's encapsulation changes (a different GWLB node, outer port or flow cookie), not on every packet.
 5. Strips the outer Ethernet, IP, UDP and GENEVE headers, writes a new Ethernet header addressed to the veth, and redirects the inner packet onto it with `bpf_redirect`.
 
@@ -191,13 +191,13 @@ A reply too large to leave the uplink once encapsulated (larger than `max_inner_
 
 1. **Create a netns** for the endpoint, named after the VPC endpoint ID.
 2. **Create a veth pair** and move the inner end into the netns.
-   - Names come from the ENI ID (`FormatInterfaceName` in [cmd/utils.go](cmd/utils.go)): `gxdp<id>` for the outer end and `gwlb<id>` for the inner end.
+   - Names come from the VPC endpoint ID (`FormatInterfaceName` in [cmd/utils.go](cmd/utils.go)): `gxdp<id>` for the outer end and `gwlb<id>` for the inner end.
    - MTU is `--mtu`, 8500 by default (see [MTU and offloads](#mtu-and-offloads)).
    - MACs are derived from the endpoint ID instead of being random (`FormatInterfaceMAC` in [cmd/utils.go](cmd/utils.go)): `02` for the outer end or `06` for the inner end, followed by the last 10 hex digits of the ID. For `vpce-0123456789abcdef0`, the inner end is `06:78:9a:bc:de:f0`. This makes them easy to spot in captures and stable across `remove`/`add`. Setting them explicitly also stops systemd-udevd's default `MACAddressPolicy=persistent` from replacing a random MAC after `add` has recorded it.
 3. **Turn ARP/ND off on the inner end** (`IFF_NOARP`). encap replaces the reply's whole Ethernet header, so the destination MAC the netns picks never reaches the wire. With ARP on, though, the netns's kernel would hold every reply until it resolved the next hop, and nothing would answer, because the root netns only answers for its own addresses. With ARP off, the kernel sends right away to the interface's own MAC, whatever the routes look like. Nothing needs to resolve the inner end either, since decap addresses every frame it delivers directly.
 4. **Disable offloads** on both ends: TX checksum offload and every segmentation and GRO offload (TSO, GSO, USO, GRO and so on; see `vethDisabledFeatures` in [cmd/add.go](cmd/add.go)). BPF can't compute the real L4 checksum, so the kernel has to write it before encap sees the packet. Every packet crossing the veth also has to be wire-sized, because encap would turn a GSO super-packet into one oversized frame that gets dropped.
 5. **Run `--script`**, if given, so the backend can finish its setup before the endpoint is reachable.
-6. **Go live.** Read both ends' MACs (only now, since the script may have changed the inner one), insert `ENI ID → (outer ifindex, inner MAC, outer MAC)` into `eni_to_ifindex`, and attach encap to the outer end. This is last because it's what makes the endpoint reachable.
+6. **Go live.** Read both ends' MACs (only now, since the script may have changed the inner one), insert `VPC endpoint ID → (outer ifindex, inner MAC, outer MAC)` into `vpce_to_ifindex`, and attach encap to the outer end. This is last because it's what makes the endpoint reachable.
 
 With `--no-netns`, step 1 is skipped and the inner end stays in the root netns with the same name. Nothing then keeps different endpoints' routing tables apart, which is why a dedicated netns is the default.
 
@@ -205,7 +205,7 @@ With `--no-netns`, step 1 is skipped and the inner end stays in the root netns w
 
 `remove <vpce-id>` ([cmd/remove.go](cmd/remove.go)) undoes `add` in this order:
 
-1. Delete the `eni_to_ifindex` entry.
+1. Delete the `vpce_to_ifindex` entry.
 2. Detach encap.
 3. Delete the veth pair.
 4. Delete any `flow_state`, `frag_state` and `metrics` entries keyed by that ifindex, so a future endpoint that reuses the ifindex doesn't inherit them. This happens after the veth is gone because packets already in decap or encap can still write entries until then.
@@ -219,7 +219,7 @@ Maps are pinned by name, so both programs share the same instances.
 
 | Map | Purpose |
 |---|---|
-| `eni_to_ifindex` | ENI ID → outer veth ifindex and the L2 addresses decap writes. Sized by `--max-enis`. |
+| `vpce_to_ifindex` | VPC endpoint ID → outer veth ifindex and the L2 addresses decap writes. Sized by `--max-endpoints`. |
 | `flow_state` | Inner 5-tuple plus ifindex → cached outer header. One LRU hash for both IPv4 and IPv6 (`struct flow_key` has a family tag), sized by `--max-flows`. Old flows age out automatically. Sharing one map wastes less space than separate per-family maps, but a burst of one family's flows can evict the other's. |
 | `frag_state` | encap's tracking for fragmented replies: a first fragment's addresses, protocol and fragment ID → its flow's cached outer header. LRU with 16384 entries, since an entry only needs to outlive one datagram. |
 | `metrics` | Per-CPU packet and byte counters per (ifindex, counter). Read by `serve`. |
@@ -228,7 +228,7 @@ Maps are pinned by name, so both programs share the same instances.
 
 Some settings are written into each program's `.rodata` at `setup` and are fixed until the next `setup`, instead of being looked up per packet:
 
-- `eni_mode`: NAT/terminating (default) or transparent (`--transparent`), which sets how encap orients its lookups.
+- `vpce_mode`: NAT/terminating (default) or transparent (`--transparent`), which sets how encap orients its lookups.
 - The uplink's ifindex, so encap can redirect replies without a map lookup.
 - `max_inner_len`, in both programs: uplink MTU minus 68, the largest inner packet decap delivers and encap sends.
 - `allowed_origin_addr` and `allowed_origin_mask`, from `--allowed-origin-cidr`.

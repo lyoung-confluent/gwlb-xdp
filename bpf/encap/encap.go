@@ -17,7 +17,7 @@ import (
 // sized here — Load reads their sizes back from decap's pins (see Load).
 // frag_state is encap's own, and fixed-size.
 type Config struct {
-	// Transparent hardcodes every ENI on this box as a transparent
+	// Transparent hardcodes every endpoint on this box as a transparent
 	// appliance (reply comes back with the same 5-tuple, not swapped).
 	Transparent bool
 	// Uplink is the physical interface encap sends replies out of. Its MTU
@@ -27,13 +27,13 @@ type Config struct {
 }
 
 // Program is encap, loaded but not yet attached to any interface — pin
-// it with (*Program).Pin so `add` can attach it per ENI later.
+// it with (*Program).Pin so `add` can attach it per endpoint later.
 type Program struct {
 	objs bpfObjects
 }
 
 // pinProg is where Pin pins the loaded-but-unattached encap program for
-// Attach to find and attach per ENI.
+// Attach to find and attach per endpoint.
 const pinProg = bpf.PinDir + "/prog_" + bpfProgEncap
 
 // Load loads encap, configured per cfg. Requires decap.Load to have run
@@ -56,11 +56,11 @@ func Load(cfg Config) (*Program, error) {
 		return nil, err
 	}
 
-	// eni_mode defaults to 0 (NAT/terminating) in the compiled object
+	// vpce_mode defaults to 0 (NAT/terminating) in the compiled object
 	// (bpf/encap/_encap.c); only override here to make it transparent.
 	if cfg.Transparent {
-		if err := spec.Variables[bpfVarEniMode].Set(uint8(1)); err != nil {
-			return nil, fmt.Errorf("(*ebpf.VariableSpec).Set for eni_mode failed: %w", err)
+		if err := spec.Variables[bpfVarVpceMode].Set(uint8(1)); err != nil {
+			return nil, fmt.Errorf("(*ebpf.VariableSpec).Set for vpce_mode failed: %w", err)
 		}
 	}
 
@@ -107,7 +107,7 @@ func matchPinnedMapSize(spec *ebpf.CollectionSpec, name string) (rerr error) {
 }
 
 // Pin pins encap at pinProg, not attached to anything — `add` attaches this
-// same loaded program to each ENI's veth-outer as it's provisioned.
+// same loaded program to each endpoint's veth-outer as it's provisioned.
 func (p *Program) Pin() error {
 	if err := p.objs.Encap.Pin(pinProg); err != nil {
 		return fmt.Errorf("(*ebpf.Program).Pin for %q failed: %w", pinProg, err)
@@ -116,7 +116,7 @@ func (p *Program) Pin() error {
 }
 
 // Attach attaches the pinned encap program (see (*Program).Pin) to
-// ifindex/ifname — one ENI's veth-outer — and pins the resulting link at
+// ifindex/ifname — one endpoint's veth-outer — and pins the resulting link at
 // /sys/fs/bpf/gwlb-xdp/link_encap_<ifindex>.
 func Attach(ifindex int) (_ link.Link, rerr error) {
 	prog, err := ebpf.LoadPinnedProgram(pinProg, nil)

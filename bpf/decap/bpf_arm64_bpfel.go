@@ -13,13 +13,6 @@ import (
 	"github.com/cilium/ebpf"
 )
 
-type bpfEniInfo struct {
-	_       structs.HostLayout
-	Ifindex uint32
-	Dst     [6]uint8
-	Src     [6]uint8
-}
-
 type bpfFlowKey struct {
 	_       structs.HostLayout
 	Ifindex uint32
@@ -52,13 +45,20 @@ type bpfOuterHdrCache struct {
 	_   [2]byte
 }
 
+type bpfVpceInfo struct {
+	_       structs.HostLayout
+	Ifindex uint32
+	Dst     [6]uint8
+	Src     [6]uint8
+}
+
 // Names of all BPF objects in the ELF.
 //
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
-	bpfMapEniToIfindex      = "eni_to_ifindex"
 	bpfMapFlowState         = "flow_state"
 	bpfMapMetrics           = "metrics"
+	bpfMapVpceToIfindex     = "vpce_to_ifindex"
 	bpfProgDecap            = "decap"
 	bpfVarAllowedOriginAddr = "allowed_origin_addr"
 	bpfVarAllowedOriginMask = "allowed_origin_mask"
@@ -114,9 +114,9 @@ type bpfProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfMapSpecs struct {
-	EniToIfindex *ebpf.MapSpec `ebpf:"eni_to_ifindex"`
-	FlowState    *ebpf.MapSpec `ebpf:"flow_state"`
-	Metrics      *ebpf.MapSpec `ebpf:"metrics"`
+	FlowState     *ebpf.MapSpec `ebpf:"flow_state"`
+	Metrics       *ebpf.MapSpec `ebpf:"metrics"`
+	VpceToIfindex *ebpf.MapSpec `ebpf:"vpce_to_ifindex"`
 }
 
 // bpfVariableSpecs contains global variables before they are loaded into the kernel.
@@ -148,16 +148,16 @@ func (o *bpfObjects) Close() error {
 //
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfMaps struct {
-	EniToIfindex *ebpf.Map `ebpf:"eni_to_ifindex"`
-	FlowState    *ebpf.Map `ebpf:"flow_state"`
-	Metrics      *ebpf.Map `ebpf:"metrics"`
+	FlowState     *ebpf.Map `ebpf:"flow_state"`
+	Metrics       *ebpf.Map `ebpf:"metrics"`
+	VpceToIfindex *ebpf.Map `ebpf:"vpce_to_ifindex"`
 }
 
 func (m *bpfMaps) Close() error {
 	return _BpfClose(
-		m.EniToIfindex,
 		m.FlowState,
 		m.Metrics,
+		m.VpceToIfindex,
 	)
 }
 

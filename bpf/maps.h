@@ -28,8 +28,8 @@ enum metric {
 	DECAP_CNT_PASS_NOT_GENEVE_BYTES,
 	DECAP_CNT_DROP_MALFORMED_PACKETS,
 	DECAP_CNT_DROP_MALFORMED_BYTES,
-	DECAP_CNT_DROP_UNKNOWN_ENI_PACKETS,
-	DECAP_CNT_DROP_UNKNOWN_ENI_BYTES,
+	DECAP_CNT_DROP_UNKNOWN_ENDPOINT_PACKETS,
+	DECAP_CNT_DROP_UNKNOWN_ENDPOINT_BYTES,
 	DECAP_CNT_OK_PACKETS,
 	DECAP_CNT_OK_BYTES,
 	ENCAP_CNT_DROP_MALFORMED_PACKETS,
@@ -76,7 +76,7 @@ static __always_inline void increment_metric(__u32 ifindex, __u32 idx, __u64 amo
 	__u64 *cnt = bpf_map_lookup_elem(&metrics, &key);
 
 	if (!cnt) {
-		/* First packet for this (ENI, counter): create the entry zeroed,
+		/* First packet for this (endpoint, counter): create the entry zeroed,
 		 * then re-look-up. Two CPUs can race here; the loser's BPF_NOEXIST
 		 * fails harmlessly and it increments the entry the winner made. */
 		__u64 zero = 0;

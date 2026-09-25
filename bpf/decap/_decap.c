@@ -22,7 +22,7 @@ const volatile __u8 allowed_origin_mask[4] = {0, 0, 0, 0};
 /*
  * The largest inner packet (IP header onward) decap will deliver, set once
  * by `setup` to the uplink's MTU - GENEVE_OVERHEAD (see decap.Load) — the
- * most a single GENEVE packet on the uplink can carry, and each ENI veth's
+ * most a single GENEVE packet on the uplink can carry, and each endpoint veth's
  * MTU (see `add`). Deliberately not GWLB's documented 8500: GWLB doesn't
  * hold the packets it sends to that, including the fragments it creates
  * itself when splitting a larger packet, so anything the uplink can carry
@@ -31,14 +31,14 @@ const volatile __u8 allowed_origin_mask[4] = {0, 0, 0, 0};
 const volatile __u32 max_inner_len = DEFAULT_MAX_INNER_LEN;
 
 /*
- * Value type for eni_to_ifindex: the veth-outer ifindex plus the L2 addressing
+ * Value type for vpce_to_ifindex: the veth-outer ifindex plus the L2 addressing
  * decap synthesizes into the Ethernet header (GWLB encapsulates at L3, so
  * there's no inner L2 header to preserve). All three are decap-only and looked
  * up together, so they're folded into one value for one hash lookup.
  *
- * ifindex also scopes flow_state entries to this ENI (see struct flow_key).
+ * ifindex also scopes flow_state entries to this endpoint (see struct flow_key).
  */
-struct eni_info {
+struct vpce_info {
 	__u32	ifindex;	/* veth-outer ifindex */
 	__u8	dst[6];		/* veth-outer's peer (inner) hwaddr; must match so
 				   the tenant netns accepts the frame (PACKET_HOST) */
@@ -46,19 +46,19 @@ struct eni_info {
 };
 
 /*
- * ENI ID -> veth-outer ifindex + inner mac pair, looked up by decap on every
+ * VPC endpoint ID -> veth-outer ifindex + inner mac pair, looked up by decap on every
  * packet. Plain bpf_redirect(ifindex, 0) gets the same bulk-queue batching as
  * bpf_redirect_map() since Linux 5.13, so no devmap is needed. max_entries is
- * a placeholder — the loader overrides it with --max-enis before loading.
+ * a placeholder — the loader overrides it with --max-endpoints before loading.
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 1);
-	__type(key, __u64);	/* ENI ID */
-	__type(value, struct eni_info);
+	__type(key, __u64);	/* VPC endpoint ID */
+	__type(value, struct vpce_info);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 	__uint(map_flags, 0);
-} eni_to_ifindex SEC(".maps");
+} vpce_to_ifindex SEC(".maps");
 
 /*
  * Validates one GWLB GENEVE option at *pos — class/type/length must match
@@ -106,9 +106,9 @@ int decap(struct xdp_md *ctx)
 	 * happens to be after bpf_xdp_adjust_head has run. */
 	__u32 frame_len = (__u32)((__u8 *)data_end - (__u8 *)data);
 
-	/* The uplink decap is attached to. Counts pre-ENI events (not-GENEVE,
-	 * malformed, unknown-ENI) against the interface they arrived on, rather
-	 * than a synthetic 0; post-ENI events use the tenant's veth ifindex. */
+	/* The uplink decap is attached to. Counts pre-endpoint events (not-GENEVE,
+	 * malformed, unknown-endpoint) against the interface they arrived on, rather
+	 * than a synthetic 0; post-endpoint events use the tenant's veth ifindex. */
 	__u32 ingress_ifindex = ctx->ingress_ifindex;
 
 	struct ethhdr *eth = data;
@@ -189,7 +189,7 @@ int decap(struct xdp_md *ctx)
 		increment_metric(ingress_ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 		return XDP_DROP;
 	}
-	/* GWLB's own tunnel VNI, distinct from the AWS ENI ID carried as a
+	/* GWLB's own tunnel VNI, distinct from the VPC endpoint ID carried as a
 	 * GENEVE option below. GWLB never sets it, so anything else means
 	 * this box is being sent traffic it shouldn't be. */
 	if (gnv->vni[0] != 0 || gnv->vni[1] != 0 || gnv->vni[2] != 0) {
@@ -215,15 +215,15 @@ int decap(struct xdp_md *ctx)
 		return XDP_DROP;
 	}
 
-	/* Option 1: ENI ID — which VPC endpoint this packet belongs to. */
+	/* Option 1: VPC endpoint ID — which endpoint this packet belongs to. */
 	__u8 *pos = opt_start;
-	void *opt_data = parse_gwlb_opt(&pos, data_end, GWLB_OPT_TYPE_ENI, GWLB_OPT_ENI_LEN);
+	void *opt_data = parse_gwlb_opt(&pos, data_end, GWLB_OPT_TYPE_VPCE, GWLB_OPT_VPCE_LEN);
 	if (!opt_data) {
 		increment_metric(ingress_ifindex, DECAP_CNT_DROP_MALFORMED_PACKETS, 1);
 		increment_metric(ingress_ifindex, DECAP_CNT_DROP_MALFORMED_BYTES, frame_len);
 		return XDP_DROP;
 	}
-	__u64 eni_id = bpf_be64_to_cpu(*(__be64 *)opt_data);
+	__u64 vpce_id = bpf_be64_to_cpu(*(__be64 *)opt_data);
 
 	/* Option 2: Attachment ID. GWLB only ever attaches this box as a
 	 * single appliance, so anything but 0 means either a multi-appliance
@@ -251,11 +251,11 @@ int decap(struct xdp_md *ctx)
 	__u32 flow_cookie = bpf_ntohl(*(__be32 *)opt_data);
 	(void)flow_cookie;
 
-	struct eni_info *info = bpf_map_lookup_elem(&eni_to_ifindex, &eni_id);
+	struct vpce_info *info = bpf_map_lookup_elem(&vpce_to_ifindex, &vpce_id);
 	if (!info) {
-		/* ENI not provisioned by the loader, or GWLB misdirected. */
-		increment_metric(ingress_ifindex, DECAP_CNT_DROP_UNKNOWN_ENI_PACKETS, 1);
-		increment_metric(ingress_ifindex, DECAP_CNT_DROP_UNKNOWN_ENI_BYTES, frame_len);
+		/* endpoint not provisioned by the loader, or GWLB misdirected. */
+		increment_metric(ingress_ifindex, DECAP_CNT_DROP_UNKNOWN_ENDPOINT_PACKETS, 1);
+		increment_metric(ingress_ifindex, DECAP_CNT_DROP_UNKNOWN_ENDPOINT_BYTES, frame_len);
 		return XDP_DROP;
 	}
 	__u32 ifindex = info->ifindex;
@@ -309,7 +309,7 @@ int decap(struct xdp_md *ctx)
 
 	/* Cache under a single key: the tuple exactly as forwarded to the
 	 * appliance. The reply can come back in either orientation, but
-	 * encap doesn't guess — its eni_mode .rodata flag (bpf/encap/_encap.c)
+	 * encap doesn't guess — its vpce_mode .rodata flag (bpf/encap/_encap.c)
 	 * fixes this box's orientation at load time, so it looks up exactly
 	 * one. */
 	struct flow_key fwd_key;

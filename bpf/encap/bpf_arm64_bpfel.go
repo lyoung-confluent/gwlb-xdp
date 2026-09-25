@@ -53,9 +53,9 @@ const (
 	bpfMapFragState     = "frag_state"
 	bpfMapMetrics       = "metrics"
 	bpfProgEncap        = "encap"
-	bpfVarEniMode       = "eni_mode"
 	bpfVarMaxInnerLen   = "max_inner_len"
 	bpfVarUplinkIfindex = "uplink_ifindex"
+	bpfVarVpceMode      = "vpce_mode"
 )
 
 // loadBpf returns the embedded CollectionSpec for bpf.
@@ -116,9 +116,9 @@ type bpfMapSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfVariableSpecs struct {
-	EniMode       *ebpf.VariableSpec `ebpf:"eni_mode"`
 	MaxInnerLen   *ebpf.VariableSpec `ebpf:"max_inner_len"`
 	UplinkIfindex *ebpf.VariableSpec `ebpf:"uplink_ifindex"`
+	VpceMode      *ebpf.VariableSpec `ebpf:"vpce_mode"`
 }
 
 // bpfObjects contains all objects after they have been loaded into the kernel.
@@ -158,9 +158,9 @@ func (m *bpfMaps) Close() error {
 //
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfVariables struct {
-	EniMode       *ebpf.Variable `ebpf:"eni_mode"`
 	MaxInnerLen   *ebpf.Variable `ebpf:"max_inner_len"`
 	UplinkIfindex *ebpf.Variable `ebpf:"uplink_ifindex"`
+	VpceMode      *ebpf.Variable `ebpf:"vpce_mode"`
 }
 
 // bpfPrograms contains all programs after they have been loaded into the kernel.

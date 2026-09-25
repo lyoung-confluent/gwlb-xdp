@@ -15,7 +15,7 @@ import (
 	"github.com/lyoung-confluent/gwlb-xdp/bpf/encap"
 )
 
-var MaxENIs uint32 = 128
+var MaxEndpoints uint32 = 128
 var MaxFlows uint32 = 1048576
 var Transparent bool = false
 var AllowedOriginCIDR string
@@ -27,7 +27,7 @@ var SetupCmd = &cobra.Command{
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return withStateLock(func() error {
-			return RunSetup(args[0], MaxENIs, MaxFlows, Transparent, AllowedOriginCIDR)
+			return RunSetup(args[0], MaxEndpoints, MaxFlows, Transparent, AllowedOriginCIDR)
 		})
 	},
 }
@@ -35,19 +35,19 @@ var SetupCmd = &cobra.Command{
 func init() {
 	RootCmd.AddCommand(SetupCmd)
 
-	SetupCmd.Flags().Uint32Var(&MaxENIs, "max-enis", MaxENIs, "max concurrent ENIs this box can serve (sizes eni_to_ifindex)")
+	SetupCmd.Flags().Uint32Var(&MaxEndpoints, "max-endpoints", MaxEndpoints, "max concurrent endpoints this box can serve (sizes vpce_to_ifindex)")
 	SetupCmd.Flags().Uint32Var(&MaxFlows, "max-flows", MaxFlows, "max concurrent flows tracked, IPv4 and IPv6 combined (sizes the shared flow_state map)")
-	SetupCmd.Flags().BoolVar(&Transparent, "transparent", Transparent, "hardcode every ENI on this box as a transparent appliance (reply comes back with the same 5-tuple, not swapped)")
+	SetupCmd.Flags().BoolVar(&Transparent, "transparent", Transparent, "hardcode every endpoint on this box as a transparent appliance (reply comes back with the same 5-tuple, not swapped)")
 	SetupCmd.Flags().StringVar(&AllowedOriginCIDR, "allowed-origin-cidr", "", "accept GENEVE traffic only from this outer source IPv4 CIDR — the GWLB's subnet(s) — and drop any other origin; pass 0.0.0.0/0 to accept every origin")
 	// Required, with 0.0.0.0/0 as the explicit opt-out: anyone else who can
-	// reach UDP 6081 could otherwise inject packets into an ENI's netns, or
+	// reach UDP 6081 could otherwise inject packets into an endpoint's netns, or
 	// overwrite a flow's cached outer header and redirect its replies.
 	if err := SetupCmd.MarkFlagRequired("allowed-origin-cidr"); err != nil {
 		panic(err)
 	}
 }
 
-func RunSetup(intfName string, maxENIs, maxFlows uint32, transparent bool, allowedOriginCIDR string) (err error) {
+func RunSetup(intfName string, maxEndpoints, maxFlows uint32, transparent bool, allowedOriginCIDR string) (err error) {
 	intf, err := net.InterfaceByName(intfName)
 	if err != nil {
 		return fmt.Errorf("net.InterfaceByName for %q failed: %w", intfName, err)
@@ -61,7 +61,7 @@ func RunSetup(intfName string, maxENIs, maxFlows uint32, transparent bool, allow
 		}
 	}
 
-	// decap, encap and every ENI veth are sized from the uplink's MTU (see
+	// decap, encap and every endpoint veth are sized from the uplink's MTU (see
 	// bpf.MaxInnerLen), so a nonsensical one fails here, before anything is
 	// loaded.
 	maxInnerLen, err := bpf.MaxInnerLen(intf.MTU)
@@ -88,7 +88,7 @@ func RunSetup(intfName string, maxENIs, maxFlows uint32, transparent bool, allow
 	warnUplinkUDPGRO(intfName)
 
 	decapProg, err := decap.Load(decap.Config{
-		MaxENIs:           maxENIs,
+		MaxEndpoints:      maxEndpoints,
 		MaxFlows:          maxFlows,
 		MaxInnerLen:       uint32(maxInnerLen),
 		AllowedOriginCIDR: originCIDR,
@@ -119,7 +119,7 @@ func RunSetup(intfName string, maxENIs, maxFlows uint32, transparent bool, allow
 		return fmt.Errorf("encap.Load failed: %w", err)
 	}
 
-	// Not attached here — `add` attaches this program per ENI veth-outer.
+	// Not attached here — `add` attaches this program per endpoint veth-outer.
 	if err := encapProg.Pin(); err != nil {
 		return fmt.Errorf("(*encap.Program).Pin failed: %w", err)
 	}

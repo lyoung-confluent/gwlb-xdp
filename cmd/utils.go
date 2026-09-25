@@ -54,7 +54,7 @@ func ParseIPv4CIDR(cidr string) (netip.Prefix, error) {
 }
 
 // ParseVPCEID parses a VPC endpoint ID into the GWLB ID decap matches
-// against GENEVE's ENI ID option: its hex suffix, in either AWS's current
+// against GENEVE's VPC endpoint ID option: its hex suffix, in either AWS's current
 // 17-hex-digit form (vpce-0123456789abcdef0) or the legacy 8-hex-digit one
 // (vpce-1a2b3c4d). Hex digits may be either case.
 func ParseVPCEID(vpceID string) (gwlbID uint64, err error) {
@@ -95,7 +95,7 @@ const (
 // FormatInterfaceName returns the name of one end of gwlbID's veth pair.
 // inner selects which end: true for the backend/appliance-facing end, false
 // for the decap/encap-facing end. The naming doesn't depend on whether the
-// ENI is namespace-isolated — only which netns the inner end ends up in does.
+// endpoint is namespace-isolated — only which netns the inner end ends up in does.
 func FormatInterfaceName(gwlbID uint64, inner bool) string {
 	prefix := gxdpPrefix
 	if inner {
@@ -118,7 +118,7 @@ const (
 // are 02:78:9a:bc:de:f0 (outer) and 06:78:9a:bc:de:f0 (inner), and it stays
 // the same across remove and re-add.
 //
-// Two ENIs whose IDs share those 40 bits get the same MACs, which is
+// Two endpoints whose IDs share those 40 bits get the same MACs, which is
 // harmless: each veth pair is a separate two-node link, and even in
 // --no-netns mode neighbor tables are per interface.
 func FormatInterfaceMAC(gwlbID uint64, inner bool) net.HardwareAddr {

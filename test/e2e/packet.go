@@ -1,8 +1,8 @@
 //go:build e2e
 
 // Package e2e sends a synthetic AWS GWLB GENEVE packet across real veth
-// interfaces (decap's uplink, the ENI's veth pair) and a real UDP echo
-// server in the ENI's netns, then checks the GENEVE reply that comes back —
+// interfaces (decap's uplink, the endpoint's veth pair) and a real UDP echo
+// server in the endpoint's netns, then checks the GENEVE reply that comes back —
 // exercising decap and encap together without a real GWLB. See e2e_test.go.
 //
 // Everything here — Ethernet/IPv4/UDP framing and the GENEVE header/options
@@ -29,7 +29,7 @@ const (
 	genevePort = 6081
 
 	geneveOptClassAWS       = 0x0108
-	geneveOptTypeENI        = 0x01
+	geneveOptTypeVPCE       = 0x01
 	geneveOptTypeAttachment = 0x02
 	geneveOptTypeCookie     = 0x03
 )
@@ -37,11 +37,11 @@ const (
 var serializeOpts = gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
 
 // buildGeneveOptions returns the three mandatory AWS GWLB GENEVE options
-// (ENI ID, attachment ID, flow cookie), in the exact fixed order decap
+// (VPC endpoint ID, attachment ID, flow cookie), in the exact fixed order decap
 // assumes them to be in (see bpf/decap/_decap.c and bpf/geneve_defs.h).
-func buildGeneveOptions(eniID, attachmentID uint64, flowCookie uint32) []*layers.GeneveOption {
-	eniData := make([]byte, 8)
-	binary.BigEndian.PutUint64(eniData, eniID)
+func buildGeneveOptions(endpointID, attachmentID uint64, flowCookie uint32) []*layers.GeneveOption {
+	endpointData := make([]byte, 8)
+	binary.BigEndian.PutUint64(endpointData, endpointID)
 
 	attData := make([]byte, 8)
 	binary.BigEndian.PutUint64(attData, attachmentID)
@@ -50,7 +50,7 @@ func buildGeneveOptions(eniID, attachmentID uint64, flowCookie uint32) []*layers
 	binary.BigEndian.PutUint32(cookieData, flowCookie)
 
 	return []*layers.GeneveOption{
-		{Class: geneveOptClassAWS, Type: geneveOptTypeENI, Data: eniData},
+		{Class: geneveOptClassAWS, Type: geneveOptTypeVPCE, Data: endpointData},
 		{Class: geneveOptClassAWS, Type: geneveOptTypeAttachment, Data: attData},
 		{Class: geneveOptClassAWS, Type: geneveOptTypeCookie, Data: cookieData},
 	}
@@ -510,7 +510,7 @@ type tcpSegment struct {
 }
 
 // buildInnerTCPv4 serializes an inner IPv4/TCP segment, for driving a real
-// TCP connection to a server in the ENI's netns (see TestTCPBulkReply).
+// TCP connection to a server in the endpoint's netns (see TestTCPBulkReply).
 func buildInnerTCPv4(s tcpSegment) ([]byte, error) {
 	innerIP := &layers.IPv4{
 		Version:  4,

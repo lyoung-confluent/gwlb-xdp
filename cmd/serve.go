@@ -66,7 +66,7 @@ type counterKey struct {
 // fails.
 //
 // Deltas rather than the BPF map's cumulative totals: the totals drop back to
-// zero whenever an ENI is removed and re-added or the programs are reloaded,
+// zero whenever an endpoint is removed and re-added or the programs are reloaded,
 // and CloudWatch has no reset-aware rate() to take over raw totals. The first
 // sample only sets the baseline, so starting serve on a long-running box
 // doesn't push everything counted so far as one burst.
@@ -175,7 +175,7 @@ func flushCounters(conn net.Conn, prev map[counterKey]uint64) (map[counterKey]ui
 //
 // A row missing from prev is new since then and started at zero, so its
 // delta is its whole value; so is a row whose value went down, which can
-// only mean it was swept (ENI removed) and recreated in between.
+// only mean it was swept (endpoint removed) and recreated in between.
 func counterLines(cur, prev map[counterKey]uint64, labels map[uint32]string) map[uint32][]string {
 	perIface := make(map[uint32][]string)
 	for key, val := range cur {
@@ -268,8 +268,8 @@ func sampleCounters() (map[counterKey]uint64, error) {
 
 // interfaceTags maps each interface's ifindex to the DogStatsD tag suffix the
 // CloudWatch agent turns into CloudWatch dimensions: interface always, plus
-// gwlb_id when the interface is one of this box's provisioned ENIs. Rebuilt
-// every tick since interfaces come and go as ENIs are added/removed.
+// gwlb_id when the interface is one of this box's provisioned endpoints. Rebuilt
+// every tick since interfaces come and go as endpoints are added/removed.
 func interfaceTags() (map[uint32]string, error) {
 	ifaces, err := net.Interfaces()
 	if err != nil {

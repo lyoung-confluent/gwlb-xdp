@@ -45,12 +45,12 @@ func assertRoundTrip(t *testing.T, fd int, uplinkIface, gwlbIface *net.Interface
 }
 
 // assertNotProvisioned checks that nothing of gwlbID's is left behind: no
-// eni_to_ifindex entry, veth, netns or encap link pin.
+// vpce_to_ifindex entry, veth, netns or encap link pin.
 func assertNotProvisioned(t *testing.T, gwlbID uint64) {
 	t.Helper()
 	vpceID := cmd.FormatVPCEID(gwlbID)
-	if _, err := decap.LookupENI(gwlbID); !errors.Is(err, ebpf.ErrKeyNotExist) {
-		t.Errorf("decap.LookupENI(%s) = %v, want ErrKeyNotExist", vpceID, err)
+	if _, err := decap.LookupEndpoint(gwlbID); !errors.Is(err, ebpf.ErrKeyNotExist) {
+		t.Errorf("decap.LookupEndpoint(%s) = %v, want ErrKeyNotExist", vpceID, err)
 	}
 	for _, inner := range []bool{false, true} {
 		name := cmd.FormatInterfaceName(gwlbID, inner)
@@ -74,9 +74,9 @@ func encapPins(t *testing.T) []string {
 	return pins
 }
 
-// TestAddAlreadyProvisioned checks that running `add` for an ENI that's
+// TestAddAlreadyProvisioned checks that running `add` for an endpoint that's
 // already provisioned — a retry, or the other netns mode — fails without
-// touching the live ENI: its map entry, veth and netns all survive, and it
+// touching the live endpoint: its map entry, veth and netns all survive, and it
 // keeps answering.
 func TestAddAlreadyProvisioned(t *testing.T) {
 	requireRoot(t)
@@ -93,30 +93,30 @@ func TestAddAlreadyProvisioned(t *testing.T) {
 
 			uplinkIface, gwlbIface := setupUplink(t)
 			runSetup(t, 8)
-			one := provisionENI(t, gwlbID, isolated, echoServerPort, func(b []byte) []byte { return b })
+			one := provisionEndpoint(t, gwlbID, isolated, echoServerPort, func(b []byte) []byte { return b })
 			fd := openGWLBSocket(t, gwlbIface)
 
 			for _, again := range []bool{isolated, !isolated} {
 				if err := cmd.RunAdd(vpceID, "", again, 0); err == nil {
-					t.Errorf("cmd.RunAdd(%q, isolated=%v) of a provisioned ENI succeeded, want an error", vpceID, again)
+					t.Errorf("cmd.RunAdd(%q, isolated=%v) of a provisioned endpoint succeeded, want an error", vpceID, again)
 				}
 			}
 
-			info, err := decap.LookupENI(gwlbID)
+			info, err := decap.LookupEndpoint(gwlbID)
 			if err != nil {
-				t.Fatalf("decap.LookupENI after the repeated adds failed: %v", err)
+				t.Fatalf("decap.LookupEndpoint after the repeated adds failed: %v", err)
 			}
 			if info.Ifindex != one.outerIfindex {
-				t.Errorf("eni_to_ifindex ifindex = %d, want %d (unchanged)", info.Ifindex, one.outerIfindex)
+				t.Errorf("vpce_to_ifindex ifindex = %d, want %d (unchanged)", info.Ifindex, one.outerIfindex)
 			}
 			if _, err := net.InterfaceByIndex(int(one.outerIfindex)); err != nil {
-				t.Errorf("the live ENI's veth is gone: %v", err)
+				t.Errorf("the live endpoint's veth is gone: %v", err)
 			}
 			ns, err := netns.GetFromName(vpceID)
 			if isolated && err != nil {
-				t.Errorf("the live ENI's netns is gone: %v", err)
+				t.Errorf("the live endpoint's netns is gone: %v", err)
 			} else if !isolated && err == nil {
-				t.Errorf("a netns %q appeared for a --no-netns ENI", vpceID)
+				t.Errorf("a netns %q appeared for a --no-netns endpoint", vpceID)
 			}
 			if err == nil {
 				ns.Close()
@@ -129,7 +129,7 @@ func TestAddAlreadyProvisioned(t *testing.T) {
 
 // TestAddRollback checks that an `add` that fails partway (here: its
 // --script fails, after the netns and veth exist) removes everything it
-// created, leaves an unrelated ENI alone, and can simply be run again.
+// created, leaves an unrelated endpoint alone, and can simply be run again.
 func TestAddRollback(t *testing.T) {
 	requireRoot(t)
 	_ = unix.Mount("bpf", "/sys/fs/bpf", "bpf", 0, "")
@@ -145,7 +145,7 @@ func TestAddRollback(t *testing.T) {
 
 			uplinkIface, gwlbIface := setupUplink(t)
 			runSetup(t, 8)
-			provisionENI(t, bystanderID, true, echoServerPort, func(b []byte) []byte { return b })
+			provisionEndpoint(t, bystanderID, true, echoServerPort, func(b []byte) []byte { return b })
 			fd := openGWLBSocket(t, gwlbIface)
 			pinsBefore := encapPins(t)
 
@@ -189,16 +189,16 @@ func TestAddScriptSetsMAC(t *testing.T) {
 	uplinkIface, gwlbIface := setupUplink(t)
 	runSetup(t, 8)
 	script := writeScript(t, `exec ip -n "$1" link set dev "$2" address `+scriptMAC)
-	provisionENIWith(t, gwlbID, true, script, 0, echoServerPort, func(b []byte) []byte { return b })
+	provisionEndpointWith(t, gwlbID, true, script, 0, echoServerPort, func(b []byte) []byte { return b })
 	fd := openGWLBSocket(t, gwlbIface)
 
-	info, err := decap.LookupENI(gwlbID)
+	info, err := decap.LookupEndpoint(gwlbID)
 	if err != nil {
-		t.Fatalf("decap.LookupENI failed: %v", err)
+		t.Fatalf("decap.LookupEndpoint failed: %v", err)
 	}
 	want, _ := net.ParseMAC(scriptMAC)
 	if !bytes.Equal(info.Dst[:], want) {
-		t.Errorf("eni_to_ifindex dst MAC = %v, want %v (as set by --script)", net.HardwareAddr(info.Dst[:]), want)
+		t.Errorf("vpce_to_ifindex dst MAC = %v, want %v (as set by --script)", net.HardwareAddr(info.Dst[:]), want)
 	}
 
 	assertRoundTrip(t, fd, uplinkIface, gwlbIface, gwlbID)

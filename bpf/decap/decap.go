@@ -15,8 +15,8 @@ import (
 	"github.com/lyoung-confluent/gwlb-xdp/bpf"
 )
 
-// EniInfo is eni_to_ifindex's map value (struct eni_info in _decap.c).
-type EniInfo = bpfEniInfo
+// VpceInfo is vpce_to_ifindex's map value (struct vpce_info in _decap.c).
+type VpceInfo = bpfVpceInfo
 
 // PinLink is where Attach pins decap's XDP attachment, and teardown checks
 // for before calling Detach.
@@ -24,8 +24,8 @@ const PinLink = bpf.PinDir + "/link_" + bpfProgDecap
 
 // Config sizes and configures decap before it's loaded.
 type Config struct {
-	// MaxENIs sizes eni_to_ifindex and metrics.
-	MaxENIs uint32
+	// MaxEndpoints sizes vpce_to_ifindex and metrics.
+	MaxEndpoints uint32
 	// MaxFlows sizes the one shared flow_state map — IPv4 and IPv6 flows
 	// together, not each.
 	MaxFlows uint32
@@ -56,9 +56,9 @@ func Load(cfg Config) (*Program, error) {
 		return nil, fmt.Errorf("loadBpf failed: %w", err)
 	}
 
-	spec.Maps[bpfMapEniToIfindex].MaxEntries = cfg.MaxENIs
+	spec.Maps[bpfMapVpceToIfindex].MaxEntries = cfg.MaxEndpoints
 	spec.Maps[bpfMapFlowState].MaxEntries = max(cfg.MaxFlows, 1)
-	spec.Maps[bpfMapMetrics].MaxEntries *= (cfg.MaxENIs + 1)
+	spec.Maps[bpfMapMetrics].MaxEntries *= (cfg.MaxEndpoints + 1)
 
 	if cfg.MaxInnerLen != 0 {
 		if err := spec.Variables[bpfVarMaxInnerLen].Set(cfg.MaxInnerLen); err != nil {
@@ -139,10 +139,10 @@ func UplinkIfindex() (int, error) {
 	return int(xdp.Ifindex), nil
 }
 
-// ProvisionedENIs returns the ENI IDs currently in eni_to_ifindex, or nil if
+// ProvisionedEndpoints returns the VPC endpoint IDs currently in vpce_to_ifindex, or nil if
 // the map isn't pinned or can't be read.
-func ProvisionedENIs() ([]uint64, error) {
-	m, err := ebpf.LoadPinnedMap(bpf.PinDir+"/"+bpfMapEniToIfindex, nil)
+func ProvisionedEndpoints() ([]uint64, error) {
+	m, err := ebpf.LoadPinnedMap(bpf.PinDir+"/"+bpfMapVpceToIfindex, nil)
 	if err != nil {
 		return nil, nil
 	}
@@ -150,91 +150,91 @@ func ProvisionedENIs() ([]uint64, error) {
 
 	var ids []uint64
 	var gwlbID uint64
-	var info EniInfo
+	var info VpceInfo
 	it := m.Iterate()
 	for it.Next(&gwlbID, &info) {
 		ids = append(ids, gwlbID)
 	}
 	if err := it.Err(); err != nil {
-		return nil, fmt.Errorf("(*ebpf.Map.Iterator).Err for %s failed: %w", bpfMapEniToIfindex, err)
+		return nil, fmt.Errorf("(*ebpf.Map.Iterator).Err for %s failed: %w", bpfMapVpceToIfindex, err)
 	}
 	return ids, nil
 }
 
-// AddENI inserts gwlbID -> (ifindex, dstMac, srcMac) into eni_to_ifindex,
-// failing if the ENI is already provisioned. dstMac is the veth peer's
+// AddEndpoint inserts gwlbID -> (ifindex, dstMac, srcMac) into vpce_to_ifindex,
+// failing if the endpoint is already provisioned. dstMac is the veth peer's
 // (inner) hwaddr and srcMac the veth-outer's own — decap synthesizes both
-// into the Ethernet header it builds (see struct eni_info in _decap.c).
-func AddENI(gwlbID uint64, ifindex uint32, dstMac, srcMac net.HardwareAddr) error {
-	path := bpf.PinDir + "/" + bpfMapEniToIfindex
+// into the Ethernet header it builds (see struct vpce_info in _decap.c).
+func AddEndpoint(gwlbID uint64, ifindex uint32, dstMac, srcMac net.HardwareAddr) error {
+	path := bpf.PinDir + "/" + bpfMapVpceToIfindex
 	m, err := ebpf.LoadPinnedMap(path, nil)
 	if err != nil {
 		return fmt.Errorf("ebpf.LoadPinnedMap for %q failed: %w", path, err)
 	}
 	defer m.Close()
 
-	info := EniInfo{Ifindex: ifindex}
+	info := VpceInfo{Ifindex: ifindex}
 	copy(info.Dst[:], dstMac)
 	copy(info.Src[:], srcMac)
 	if err := m.Update(&gwlbID, &info, ebpf.UpdateNoExist); err != nil {
-		return fmt.Errorf("(*ebpf.Map).Update for %s failed (ENI already provisioned?): %w", bpfMapEniToIfindex, err)
+		return fmt.Errorf("(*ebpf.Map).Update for %s failed (endpoint already provisioned?): %w", bpfMapVpceToIfindex, err)
 	}
 	return nil
 }
 
-// LookupENI returns gwlbID's eni_to_ifindex entry. The error wraps
-// ebpf.ErrKeyNotExist if the ENI isn't provisioned, or os.ErrNotExist if
+// LookupEndpoint returns gwlbID's vpce_to_ifindex entry. The error wraps
+// ebpf.ErrKeyNotExist if the endpoint isn't provisioned, or os.ErrNotExist if
 // setup hasn't pinned the map yet.
-func LookupENI(gwlbID uint64) (EniInfo, error) {
-	path := bpf.PinDir + "/" + bpfMapEniToIfindex
+func LookupEndpoint(gwlbID uint64) (VpceInfo, error) {
+	path := bpf.PinDir + "/" + bpfMapVpceToIfindex
 	m, err := ebpf.LoadPinnedMap(path, nil)
 	if err != nil {
-		return EniInfo{}, fmt.Errorf("ebpf.LoadPinnedMap for %q failed: %w", path, err)
+		return VpceInfo{}, fmt.Errorf("ebpf.LoadPinnedMap for %q failed: %w", path, err)
 	}
 	defer m.Close()
 
-	var info EniInfo
+	var info VpceInfo
 	if err := m.Lookup(&gwlbID, &info); err != nil {
-		return EniInfo{}, fmt.Errorf("(*ebpf.Map).Lookup for %s failed: %w", bpfMapEniToIfindex, err)
+		return VpceInfo{}, fmt.Errorf("(*ebpf.Map).Lookup for %s failed: %w", bpfMapVpceToIfindex, err)
 	}
 	return info, nil
 }
 
-// RemoveENI deletes gwlbID's entry from eni_to_ifindex, so decap stops
+// RemoveEndpoint deletes gwlbID's entry from vpce_to_ifindex, so decap stops
 // delivering to it, and returns the entry as it stood before deletion so the
 // caller can tear down everything keyed on its ifindex (encap, the veth) and
-// then call SweepENI. The error wraps ebpf.ErrKeyNotExist if the ENI isn't
+// then call SweepEndpoint. The error wraps ebpf.ErrKeyNotExist if the endpoint isn't
 // provisioned, or os.ErrNotExist if setup hasn't pinned the map yet.
-func RemoveENI(gwlbID uint64) (EniInfo, error) {
-	path := bpf.PinDir + "/" + bpfMapEniToIfindex
+func RemoveEndpoint(gwlbID uint64) (VpceInfo, error) {
+	path := bpf.PinDir + "/" + bpfMapVpceToIfindex
 	m, err := ebpf.LoadPinnedMap(path, nil)
 	if err != nil {
-		return EniInfo{}, fmt.Errorf("ebpf.LoadPinnedMap for %q failed: %w", path, err)
+		return VpceInfo{}, fmt.Errorf("ebpf.LoadPinnedMap for %q failed: %w", path, err)
 	}
 	defer m.Close()
 
 	// Lookup then Delete rather than LookupAndDelete, which hash maps only
 	// support from Linux 5.14.
-	var info EniInfo
+	var info VpceInfo
 	if err := m.Lookup(&gwlbID, &info); err != nil {
-		return EniInfo{}, fmt.Errorf("(*ebpf.Map).Lookup for %s failed: %w", bpfMapEniToIfindex, err)
+		return VpceInfo{}, fmt.Errorf("(*ebpf.Map).Lookup for %s failed: %w", bpfMapVpceToIfindex, err)
 	}
 	if err := m.Delete(&gwlbID); err != nil {
-		return EniInfo{}, fmt.Errorf("(*ebpf.Map).Delete for %s failed: %w", bpfMapEniToIfindex, err)
+		return VpceInfo{}, fmt.Errorf("(*ebpf.Map).Delete for %s failed: %w", bpfMapVpceToIfindex, err)
 	}
 	return info, nil
 }
 
-// SweepENI deletes every flow_state/frag_state entry and metrics row keyed by
-// a removed ENI's veth-outer ifindex, so a later ENI that reuses the ifindex
+// SweepEndpoint deletes every flow_state/frag_state entry and metrics row keyed by
+// a removed endpoint's veth-outer ifindex, so a later endpoint that reuses the ifindex
 // can't inherit stale cache hits or counters.
 //
-// Call it only once nothing can still write those keys: after RemoveENI, and
+// Call it only once nothing can still write those keys: after RemoveEndpoint, and
 // after the veth itself is deleted. Deleting the veth detaches encap and
 // waits out an RCU grace period, so by then every decap or encap run that
 // might still have been using that ifindex has finished. Sweeping any
 // earlier lets those in-flight runs put entries back.
-func SweepENI(ifindex uint32) error {
+func SweepEndpoint(ifindex uint32) error {
 	return errors.Join(
 		bpf.FlowStateRemove(ifindex),
 		bpf.FragStateRemove(ifindex),

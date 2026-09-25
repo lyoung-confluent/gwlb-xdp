@@ -25,7 +25,7 @@ func init() {
 	RootCmd.AddCommand(TeardownCmd)
 }
 
-// RunTeardown reverses setup: it deprovisions any remaining ENIs, detaches
+// RunTeardown reverses setup: it deprovisions any remaining endpoints, detaches
 // decap, and removes everything pinned under /sys/fs/bpf/gwlb-xdp.
 //
 // Best-effort throughout: every step runs regardless of the previous, so a
@@ -34,9 +34,9 @@ func init() {
 func RunTeardown() error {
 	var errs []error
 
-	gwlbIDs, err := decap.ProvisionedENIs()
+	gwlbIDs, err := decap.ProvisionedEndpoints()
 	if err != nil {
-		errs = append(errs, fmt.Errorf("listing provisioned ENIs: %w", err))
+		errs = append(errs, fmt.Errorf("listing provisioned endpoints: %w", err))
 	}
 	for _, gwlbID := range gwlbIDs {
 		vpceID := FormatVPCEID(gwlbID)

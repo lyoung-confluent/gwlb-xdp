@@ -16,7 +16,7 @@ import (
 const PinDir = "/sys/fs/bpf/gwlb-xdp"
 
 // GWLBMTU is GWLB's documented MTU: the largest inner packet (IP header
-// onward) it's guaranteed to carry, and the default MTU of an ENI's veth
+// onward) it's guaranteed to carry, and the default MTU of an endpoint's veth
 // pair, so the netns sizes its own replies to it — GWLB sends no ICMP
 // "fragmentation needed", so a DF-set reply it won't carry is silently lost.
 // It is not a limit on what GWLB delivers: see MaxInnerLen.
@@ -28,12 +28,12 @@ const GWLBMTU = 8500
 const GeneveOverhead = 68
 
 // minInnerLen is the smallest MaxInnerLen allowed: Linux's minimum Ethernet
-// MTU, below which an ENI's veth can't be created.
+// MTU, below which an endpoint's veth can't be created.
 const minInnerLen = 68
 
 // MaxInnerLen returns the largest inner packet (IP header onward) one GENEVE
 // packet on an uplink with this MTU can carry. It's decap's and encap's
-// max_inner_len and the most an ENI veth's MTU can be: GWLB doesn't hold
+// max_inner_len and the most an endpoint veth's MTU can be: GWLB doesn't hold
 // what it delivers to GWLBMTU (including fragments it creates itself), so
 // decap accepts anything the uplink can carry.
 func MaxInnerLen(uplinkMTU int) (int, error) {
@@ -70,8 +70,8 @@ var CounterNames = []string{
 	"decap_pass_not_geneve_bytes",
 	"decap_drop_malformed_packets",
 	"decap_drop_malformed_bytes",
-	"decap_drop_unknown_eni_packets",
-	"decap_drop_unknown_eni_bytes",
+	"decap_drop_unknown_endpoint_packets",
+	"decap_drop_unknown_endpoint_bytes",
 	"decap_ok_packets",
 	"decap_ok_bytes",
 	"encap_drop_malformed_packets",
@@ -149,7 +149,7 @@ type metricKey struct {
 }
 
 // FlowStateRemove deletes every entry in the pinned flow_state map belonging
-// to ifindex — one removed ENI's cached flows, both address families in the
+// to ifindex — one removed endpoint's cached flows, both address families in the
 // one sweep since flow_state holds both.
 func FlowStateRemove(ifindex uint32) error {
 	return sweepByIfindex[flowKey, outerHdrCache]("flow_state", ifindex, func(k flowKey) uint32 { return k.Ifindex })
@@ -162,7 +162,7 @@ func FragStateRemove(ifindex uint32) error {
 }
 
 // MetricsRemove deletes every entry in the pinned metrics map belonging to
-// ifindex — one removed ENI's counter rows, so serve stops pushing counters
+// ifindex — one removed endpoint's counter rows, so serve stops pushing counters
 // for an interface that no longer exists.
 func MetricsRemove(ifindex uint32) error {
 	return sweepByIfindex[metricKey, uint64]("metrics", ifindex, func(k metricKey) uint32 { return k.Ifindex })

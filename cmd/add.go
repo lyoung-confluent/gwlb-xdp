@@ -29,7 +29,7 @@ var VethMTU int
 // ./gwlb-xdp add
 var AddCmd = &cobra.Command{
 	Use:   "add <vpce-0000000aabbccddee>",
-	Short: "Provision one ENI on the fly",
+	Short: "Provision one endpoint on the fly",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return withStateLock(func() error { return RunAdd(args[0], ScriptPath, !NoNetns, VethMTU) })
@@ -37,15 +37,15 @@ var AddCmd = &cobra.Command{
 }
 
 func init() {
-	AddCmd.Flags().StringVar(&ScriptPath, "script", "", "run this executable after the veth (and netns, unless --no-netns) are up but before traffic can reach this ENI (see above)")
-	AddCmd.Flags().BoolVar(&NoNetns, "no-netns", false, "keep this ENI's veth pair in the root netns instead of a dedicated one — only safe when this ENI's backend addressing doesn't overlap any other ENI's on this box")
-	AddCmd.Flags().IntVar(&VethMTU, "mtu", 0, "MTU of this ENI's veth pair, capping both what the backend sends and what it can receive; at most the uplink's MTU minus 68 (default 8500, GWLB's documented MTU, or the uplink's limit if that's smaller)")
+	AddCmd.Flags().StringVar(&ScriptPath, "script", "", "run this executable after the veth (and netns, unless --no-netns) are up but before traffic can reach this endpoint (see above)")
+	AddCmd.Flags().BoolVar(&NoNetns, "no-netns", false, "keep this endpoint's veth pair in the root netns instead of a dedicated one — only safe when this endpoint's backend addressing doesn't overlap any other endpoint's on this box")
+	AddCmd.Flags().IntVar(&VethMTU, "mtu", 0, "MTU of this endpoint's veth pair, capping both what the backend sends and what it can receive; at most the uplink's MTU minus 68 (default 8500, GWLB's documented MTU, or the uplink's limit if that's smaller)")
 	RootCmd.AddCommand(AddCmd)
 }
 
-// RunAdd provisions one ENI's veth pair. When isolated, the veth-inner peer
+// RunAdd provisions one endpoint's veth pair. When isolated, the veth-inner peer
 // moves into a dedicated netns named vpceID (the normal case); when not, it
-// stays alongside veth-outer in the root netns — only safe when no other ENI
+// stays alongside veth-outer in the root netns — only safe when no other endpoint
 // on this box has overlapping backend addressing, since nothing then
 // separates their routing tables. mtu is the veth pair's MTU, or 0 for the
 // default: bpf.GWLBMTU, or the uplink's limit if that's smaller.
@@ -61,7 +61,7 @@ func RunAdd(vpceID string, scriptPath string, isolated bool, mtu int) (err error
 		return fmt.Errorf("ParseVPCEID for %q failed: %w", vpceID, err)
 	}
 	// Name the netns (and everything else) after the canonical spelling —
-	// the one teardown derives back from the ENI ID — rather than whatever
+	// the one teardown derives back from the VPC endpoint ID — rather than whatever
 	// case/width was typed here.
 	vpceID = FormatVPCEID(gwlbID)
 
@@ -83,12 +83,12 @@ func RunAdd(vpceID string, scriptPath string, isolated bool, mtu int) (err error
 		return fmt.Errorf("--mtu %d is over %d, the most one GENEVE packet on the uplink can carry", mtu, maxMTU)
 	}
 
-	// Refuse an ENI that's already provisioned before touching anything, so
+	// Refuse an endpoint that's already provisioned before touching anything, so
 	// a repeated or retried add fails cleanly and leaves the live one alone.
-	if _, err := decap.LookupENI(gwlbID); err == nil {
+	if _, err := decap.LookupEndpoint(gwlbID); err == nil {
 		return fmt.Errorf("%s is already provisioned (remove it first)", vpceID)
 	} else if !errors.Is(err, ebpf.ErrKeyNotExist) {
-		return fmt.Errorf("decap.LookupENI for %q failed: %w", vpceID, err)
+		return fmt.Errorf("decap.LookupEndpoint for %q failed: %w", vpceID, err)
 	}
 
 	// Roll back partial state on any error — but only what this call itself
@@ -97,21 +97,21 @@ func RunAdd(vpceID string, scriptPath string, isolated bool, mtu int) (err error
 	// left alone. Cleanup failures are joined onto err so a leaked
 	// veth/netns doesn't vanish silently.
 	var (
-		createdNetns bool
-		outerIfindex int // set once this call has created the veth pair
-		insertedENI  bool
+		createdNetns     bool
+		outerIfindex     int // set once this call has created the veth pair
+		insertedEndpoint bool
 	)
 	defer func() {
 		if err == nil {
 			return
 		}
-		// First stop decap delivering to the ENI, then delete the veth
+		// First stop decap delivering to the endpoint, then delete the veth
 		// (which also removes its peer, wherever it is, and detaches
-		// encap), and only then sweep what the ENI cached — see
-		// decap.SweepENI for why that order matters.
-		if insertedENI {
-			if _, e := decap.RemoveENI(gwlbID); e != nil {
-				err = errors.Join(err, fmt.Errorf("rollback: decap.RemoveENI for %q failed: %w", vpceID, e))
+		// encap), and only then sweep what the endpoint cached — see
+		// decap.SweepEndpoint for why that order matters.
+		if insertedEndpoint {
+			if _, e := decap.RemoveEndpoint(gwlbID); e != nil {
+				err = errors.Join(err, fmt.Errorf("rollback: decap.RemoveEndpoint for %q failed: %w", vpceID, e))
 			}
 		}
 		if outerIfindex != 0 {
@@ -121,9 +121,9 @@ func RunAdd(vpceID string, scriptPath string, isolated bool, mtu int) (err error
 				}
 			}
 		}
-		if insertedENI {
-			if e := decap.SweepENI(uint32(outerIfindex)); e != nil {
-				err = errors.Join(err, fmt.Errorf("rollback: decap.SweepENI for %q failed: %w", outerName, e))
+		if insertedEndpoint {
+			if e := decap.SweepEndpoint(uint32(outerIfindex)); e != nil {
+				err = errors.Join(err, fmt.Errorf("rollback: decap.SweepEndpoint for %q failed: %w", outerName, e))
 			}
 		}
 		if createdNetns {
@@ -161,9 +161,9 @@ func RunAdd(vpceID string, scriptPath string, isolated bool, mtu int) (err error
 	// A terminating backend never sees one: its peers size their TCP
 	// segments to the MSS it advertises.
 	//
-	// Both ends get MACs derived from the ENI ID (see FormatInterfaceMAC)
+	// Both ends get MACs derived from the VPC endpoint ID (see FormatInterfaceMAC)
 	// rather than the kernel's random ones, so they're recognizable and the
-	// same every time this ENI is added. Being explicitly assigned also
+	// same every time this endpoint is added. Being explicitly assigned also
 	// keeps systemd-udevd off them: its default MACAddressPolicy=persistent
 	// replaces a kernel-random MAC asynchronously after the device appears
 	// — possibly after decap has cached the old one below — but leaves an
@@ -239,7 +239,7 @@ func RunAdd(vpceID string, scriptPath string, isolated bool, mtu int) (err error
 		return err
 	}
 
-	// Last chance to finish backend setup before this ENI is wired up and
+	// Last chance to finish backend setup before this endpoint is wired up and
 	// reachable below (see the --script flag).
 	if scriptPath != "" {
 		cmd := exec.Command(scriptPath, vpceID, innerName)
@@ -268,12 +268,12 @@ func RunAdd(vpceID string, scriptPath string, isolated bool, mtu int) (err error
 		return fmt.Errorf("netlink.LinkByIndex for %q failed: %w", outerName, err)
 	}
 
-	// Insert into eni_to_ifindex and attach encap — this makes the ENI
+	// Insert into vpce_to_ifindex and attach encap — this makes the endpoint
 	// reachable, so it happens last.
-	if err := decap.AddENI(gwlbID, uint32(outerIfindex), innerMAC, outer.Attrs().HardwareAddr); err != nil {
-		return fmt.Errorf("decap.AddENI for %q failed: %w", outerName, err)
+	if err := decap.AddEndpoint(gwlbID, uint32(outerIfindex), innerMAC, outer.Attrs().HardwareAddr); err != nil {
+		return fmt.Errorf("decap.AddEndpoint for %q failed: %w", outerName, err)
 	}
-	insertedENI = true
+	insertedEndpoint = true
 
 	if _, err := encap.Attach(outerIfindex); err != nil {
 		return fmt.Errorf("encap.Attach for %q failed: %w", outerName, err)
@@ -282,7 +282,7 @@ func RunAdd(vpceID string, scriptPath string, isolated bool, mtu int) (err error
 	return nil
 }
 
-// uplinkVethMTU returns the largest MTU for a new ENI's veth pair: bpf.MaxInnerLen of
+// uplinkVethMTU returns the largest MTU for a new endpoint's veth pair: bpf.MaxInnerLen of
 // the MTU of the uplink decap is attached to. That's the same value `setup`
 // gave decap and encap, unless the uplink's MTU has changed since — in which
 // case re-run `setup`.
@@ -303,7 +303,7 @@ func uplinkVethMTU() (int, error) {
 }
 
 // vethDisabledFeatures are the ethtool features disableVethOffloads turns off
-// on both ends of an ENI's veth pair.
+// on both ends of an endpoint's veth pair.
 //
 // tx-checksum-ip-generic: encap can't compute an inner L4 checksum in BPF, so
 // the netns egress path must write the real one into the bytes itself.

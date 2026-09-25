@@ -16,15 +16,15 @@ const volatile __u32 uplink_ifindex = 0;
 
 /*
  * Reply orientation, set once by `setup` for the life of the program (see
- * setEniMode in cmd/setup.go): 0 (default) means every ENI on this box is
+ * --transparent in cmd/setup.go): 0 (default) means every endpoint on this box is
  * NAT/terminating, so replies come back with src/dst swapped and encap
- * looks up the swapped tuple; 1 means every ENI is a transparent appliance
+ * looks up the swapped tuple; 1 means every endpoint is a transparent appliance
  * that returns each packet with the same 5-tuple it received, so encap
- * looks up the literal tuple. Box-wide rather than per-ENI: this lets it live
+ * looks up the literal tuple. Box-wide rather than per-endpoint: this lets it live
  * in .rodata (a single scalar, fixed at load time) instead of a per-ifindex
  * map lookup on every packet.
  */
-const volatile __u8 eni_mode = 0;
+const volatile __u8 vpce_mode = 0;
 
 /*
  * The largest reply (IP header onward) encap will encapsulate, set once by
@@ -103,7 +103,7 @@ int encap(struct xdp_md *ctx)
 
 	__u32 ifindex = ctx->ingress_ifindex;
 
-	bool transparent = eni_mode != 0;
+	bool transparent = vpce_mode != 0;
 
 	struct ethhdr *eth = data;
 	if ((void *)(eth + 1) > data_end) {
@@ -160,7 +160,7 @@ int encap(struct xdp_md *ctx)
 		 * to key on. But it quotes the offending packet right after its
 		 * own 8-byte header — a packet decap delivered, so its tuple, as
 		 * quoted, is exactly the forward key decap cached the flow under
-		 * (in either eni_mode). Matching that entry sends the error back
+		 * (in either vpce_mode). Matching that entry sends the error back
 		 * with its flow's own GENEVE options, flow cookie included. */
 		struct inner_tuple q;
 		void *ql4;
