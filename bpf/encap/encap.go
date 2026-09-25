@@ -15,7 +15,7 @@ import (
 
 // Config configures encap before it's loaded. flow_state/metrics aren't
 // sized here — Load reads their sizes back from decap's pins (see Load).
-// frag_state is encap's own, and fixed-size.
+// frag_state is encap's own — MaxFragEntries sizes it.
 type Config struct {
 	// Transparent hardcodes every ENI on this box as a transparent
 	// appliance (reply comes back with the same 5-tuple, not swapped).
@@ -24,6 +24,10 @@ type Config struct {
 	// caps the largest reply encap will encapsulate (see max_inner_len in
 	// _encap.c).
 	Uplink *net.Interface
+	// MaxFragEntries sizes frag_state, encap's own LRU map of in-flight
+	// reply fragments (see _encap.c). Zero is treated as 1, same as
+	// decap.Config's MaxFlows.
+	MaxFragEntries uint32
 }
 
 // Program is encap, loaded but not yet attached to any interface — pin
@@ -55,6 +59,7 @@ func Load(cfg Config) (*Program, error) {
 	if err := matchPinnedMapSize(spec, bpfMapMetrics); err != nil {
 		return nil, err
 	}
+	spec.Maps[bpfMapFragState].MaxEntries = max(cfg.MaxFragEntries, 1)
 
 	// eni_mode defaults to 0 (NAT/terminating) in the compiled object
 	// (bpf/encap/_encap.c); only override here to make it transparent.

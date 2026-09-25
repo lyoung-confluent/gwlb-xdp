@@ -17,6 +17,7 @@ import (
 
 var MaxENIs uint32 = 128
 var MaxFlows uint32 = 1048576
+var MaxFragEntries uint32 = 16384
 var Transparent bool = false
 var AllowedOriginCIDR string
 
@@ -27,7 +28,7 @@ var SetupCmd = &cobra.Command{
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return withStateLock(func() error {
-			return RunSetup(args[0], MaxENIs, MaxFlows, Transparent, AllowedOriginCIDR)
+			return RunSetup(args[0], MaxENIs, MaxFlows, MaxFragEntries, Transparent, AllowedOriginCIDR)
 		})
 	},
 }
@@ -37,6 +38,7 @@ func init() {
 
 	SetupCmd.Flags().Uint32Var(&MaxENIs, "max-enis", MaxENIs, "max concurrent ENIs this box can serve (sizes eni_to_ifindex)")
 	SetupCmd.Flags().Uint32Var(&MaxFlows, "max-flows", MaxFlows, "max concurrent flows tracked, IPv4 and IPv6 combined (sizes the shared flow_state map)")
+	SetupCmd.Flags().Uint32Var(&MaxFragEntries, "max-frag-entries", MaxFragEntries, "max in-flight reply fragments tracked at once (sizes encap's frag_state map)")
 	SetupCmd.Flags().BoolVar(&Transparent, "transparent", Transparent, "hardcode every ENI on this box as a transparent appliance (reply comes back with the same 5-tuple, not swapped)")
 	SetupCmd.Flags().StringVar(&AllowedOriginCIDR, "allowed-origin-cidr", "", "accept GENEVE traffic only from this outer source IPv4 CIDR — the GWLB's subnet(s) — and drop any other origin; pass 0.0.0.0/0 to accept every origin")
 	// Required, with 0.0.0.0/0 as the explicit opt-out: anyone else who can
@@ -47,7 +49,7 @@ func init() {
 	}
 }
 
-func RunSetup(intfName string, maxENIs, maxFlows uint32, transparent bool, allowedOriginCIDR string) (err error) {
+func RunSetup(intfName string, maxENIs, maxFlows, maxFragEntries uint32, transparent bool, allowedOriginCIDR string) (err error) {
 	intf, err := net.InterfaceByName(intfName)
 	if err != nil {
 		return fmt.Errorf("net.InterfaceByName for %q failed: %w", intfName, err)
@@ -112,8 +114,9 @@ func RunSetup(intfName string, maxENIs, maxFlows uint32, transparent bool, allow
 	}()
 
 	encapProg, err := encap.Load(encap.Config{
-		Transparent: transparent,
-		Uplink:      intf,
+		Transparent:    transparent,
+		Uplink:         intf,
+		MaxFragEntries: maxFragEntries,
 	})
 	if err != nil {
 		return fmt.Errorf("encap.Load failed: %w", err)

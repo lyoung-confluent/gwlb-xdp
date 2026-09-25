@@ -43,12 +43,14 @@ const volatile __u32 max_inner_len = DEFAULT_MAX_INNER_LEN;
  * the L4 header its flow_key needs, so when encap matches a first fragment
  * to its flow it records that flow's cached outer header here, keyed by the
  * fragment's own (as-observed) addresses, protocol and identification — see
- * frag_key. The later fragments look that up instead of flow_state. LRU and
- * fixed-size: an entry only needs to outlive one datagram's fragments.
+ * frag_key. The later fragments look that up instead of flow_state. LRU:
+ * an entry only needs to outlive one datagram's fragments. Sized by
+ * encap.Load (see encap.Config's MaxFragEntries) — max_entries here is
+ * just a placeholder.
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
-	__uint(max_entries, 16384);
+	__uint(max_entries, 1);
 	__type(key, struct flow_key);
 	__type(value, struct outer_hdr_cache);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);

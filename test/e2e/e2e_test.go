@@ -160,7 +160,7 @@ func setupUplink(t *testing.T) (uplinkIface, gwlbIface *net.Interface) {
 // would, and registers `teardown` to reverse it.
 func runSetup(t *testing.T, maxENIs uint32) {
 	t.Helper()
-	if err := cmd.RunSetup(uplinkIfName, maxENIs, 64, false, ""); err != nil {
+	if err := cmd.RunSetup(uplinkIfName, maxENIs, 64, 64, false, ""); err != nil {
 		t.Fatalf("cmd.RunSetup failed: %v", err)
 	}
 	t.Cleanup(func() {
@@ -802,7 +802,7 @@ func TestOriginFiltering(t *testing.T) {
 
 	uplinkIface, gwlbIface := setupUplink(t)
 	// fakeGWLBOuterSrcIP (198.51.100.1) falls inside this /30.
-	if err := cmd.RunSetup(uplinkIfName, 8, 64, false, "198.51.100.0/30"); err != nil {
+	if err := cmd.RunSetup(uplinkIfName, 8, 64, 64, false, "198.51.100.0/30"); err != nil {
 		t.Fatalf("cmd.RunSetup failed: %v", err)
 	}
 	t.Cleanup(func() {
