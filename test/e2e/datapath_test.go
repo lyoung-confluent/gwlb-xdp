@@ -384,7 +384,7 @@ func TestFragmentedReply(t *testing.T) {
 	uplinkIface, gwlbIface := setupUplink(t)
 	runSetup(t, 8)
 	// Each reply is three copies of its request: 4000 bytes in, 12000 out —
-	// over the netns's 8500-byte route MTU, so the backend fragments it.
+	// over the veth's 8500-byte MTU, so the backend fragments it.
 	one := provisionENI(t, gwlbID, true, echoServerPort, func(b []byte) []byte { return bytes.Repeat(b, 3) })
 	fd := openGWLBSocket(t, gwlbIface)
 
@@ -593,10 +593,11 @@ func fragmentInner(t *testing.T, inner []byte, v6 bool, firstLen int, id uint32)
 }
 
 // TestLargeRequests checks that decap delivers everything the uplink can
-// carry, not just GWLB's documented 8500 bytes: a whole inner packet at the
-// uplink's limit, and a datagram arriving as fragments sized the way GWLB
-// fragments a packet too large for it (an 8812-byte first fragment, DF kept
-// on both). For the fragmented requests, the backend's short reply can only
+// carry, not just GWLB's documented 8500 bytes, to an ENI added with --mtu
+// at the uplink's limit (the default 8500 would drop these at the veth): a
+// whole inner packet at that limit, and a datagram arriving as fragments
+// sized the way GWLB fragments a packet too large for it (an 8812-byte first
+// fragment, DF kept on both). For the fragmented requests, the backend's short reply can only
 // be matched if decap cached the flow from the first fragment's real
 // transport header — for IPv6, the one behind its fragment header.
 func TestLargeRequests(t *testing.T) {
@@ -608,7 +609,7 @@ func TestLargeRequests(t *testing.T) {
 
 	uplinkIface, gwlbIface := setupUplink(t)
 	runSetup(t, 8)
-	one := provisionENI(t, gwlbID, true, echoServerPort, func(b []byte) []byte { return bytes.Clone(b[:min(len(b), replyLen)]) })
+	one := provisionENIWith(t, gwlbID, true, "", 9001-bpf.GeneveOverhead, echoServerPort, func(b []byte) []byte { return bytes.Clone(b[:min(len(b), replyLen)]) })
 	fd := openGWLBSocket(t, gwlbIface)
 
 	cases := []struct {
@@ -698,7 +699,7 @@ func TestLargeRequests(t *testing.T) {
 // once the uplink's MTU has shrunk since `setup` (which fixed encap's limit)
 // while the ENI's veth was sized from a larger one: here setup sees a
 // 1500-byte uplink (limit 1500 - 68 = 1432) and add a 9001-byte one (veth
-// 8933), so the backend's 2028-byte reply crosses the veth whole.
+// 8500), so the backend's 2028-byte reply crosses the veth whole.
 func TestEncapOversizeDropped(t *testing.T) {
 	requireRoot(t)
 	_ = unix.Mount("bpf", "/sys/fs/bpf", "bpf", 0, "")
@@ -756,7 +757,7 @@ func TestTCPBulkReply(t *testing.T) {
 		tcpPort   = 18080
 		bulkLen   = 60000
 		clientISN = 1000
-		mss       = bpf.GWLBMTU - 40 // what the netns's route MTU gives it
+		mss       = bpf.GWLBMTU - 40 // what the veth's MTU gives it
 	)
 
 	uplinkIface, gwlbIface := setupUplink(t)
@@ -842,7 +843,7 @@ func TestTCPBulkReply(t *testing.T) {
 			t.Errorf("encapsulated segment is a %d-byte frame, over the uplink's 9001-byte MTU", len(f))
 		}
 		if innerLen > bpf.GWLBMTU {
-			t.Errorf("inner segment is %d bytes, over the netns's %d-byte route MTU", innerLen, bpf.GWLBMTU)
+			t.Errorf("inner segment is %d bytes, over the veth's %d-byte MTU", innerLen, bpf.GWLBMTU)
 		}
 		off := int(tcp.Seq - serverISN - 1)
 		if off < 0 || off+len(tcp.Payload) > bulkLen {

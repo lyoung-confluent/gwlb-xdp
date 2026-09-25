@@ -230,24 +230,24 @@ var backendAddrs = []backendAddr{
 // transform before being echoed back, so a test can tell which ENI's backend
 // actually answered — pass bytes.Clone (or similar) for a plain echo.
 //
-// Each family's connected route gets a route MTU of bpf.GWLBMTU, the way a
-// real deployment's --script would set its routes up (see README.md).
+// The veth pair gets add's default MTU (bpf.GWLBMTU), so the backend's own
+// traffic is sized to GWLB's documented MTU with no route MTU needed.
 //
 // No neighbor entry is pinned for the client address, even though it's
 // on-link and nothing will ever answer ARP/ND for it: `add` turns ARP off on
 // veth-inner, so the echo server's reply needs none (see cmd/add.go).
 func provisionENI(t *testing.T, gwlbID uint64, isolated bool, echoPort int, transform func([]byte) []byte) eni {
 	t.Helper()
-	return provisionENIWithScript(t, gwlbID, isolated, "", echoPort, transform)
+	return provisionENIWith(t, gwlbID, isolated, "", 0, echoPort, transform)
 }
 
-// provisionENIWithScript is provisionENI, passing scriptPath to `add` as its
-// --script.
-func provisionENIWithScript(t *testing.T, gwlbID uint64, isolated bool, scriptPath string, echoPort int, transform func([]byte) []byte) eni {
+// provisionENIWith is provisionENI, passing scriptPath to `add` as its
+// --script and mtu as its --mtu (0 for the default).
+func provisionENIWith(t *testing.T, gwlbID uint64, isolated bool, scriptPath string, mtu int, echoPort int, transform func([]byte) []byte) eni {
 	t.Helper()
 
 	vpceID := cmd.FormatVPCEID(gwlbID)
-	if err := cmd.RunAdd(vpceID, scriptPath, isolated); err != nil {
+	if err := cmd.RunAdd(vpceID, scriptPath, isolated, mtu); err != nil {
 		t.Fatalf("cmd.RunAdd(%q, isolated=%v) failed: %v", vpceID, isolated, err)
 	}
 
@@ -305,23 +305,6 @@ func provisionENIWithScript(t *testing.T, gwlbID uint64, isolated bool, scriptPa
 		}
 		if err := nlh.AddrAdd(innerLink, addr); err != nil {
 			t.Fatalf("(*netlink.Handle).AddrAdd(%q) failed: %v", b.cidr, err)
-		}
-		// Size the backend's own traffic to GWLB's documented MTU with a
-		// route MTU, as README.md asks of real deployments: the veth's
-		// interface MTU is larger (see cmd/add.go). Replaces the kernel's
-		// own connected route (metric 0 for v4, 256 for v6).
-		prio := 0
-		if b.family == netlink.FAMILY_V6 {
-			prio = 256
-		}
-		if err := nlh.RouteReplace(&netlink.Route{
-			LinkIndex: innerLink.Attrs().Index,
-			Dst:       &net.IPNet{IP: addr.IP.Mask(addr.Mask), Mask: addr.Mask},
-			Scope:     netlink.SCOPE_LINK,
-			Priority:  prio,
-			MTU:       bpf.GWLBMTU,
-		}); err != nil {
-			t.Fatalf("(*netlink.Handle).RouteReplace for %q failed: %v", b.cidr, err)
 		}
 		// The listening socket is created *inside* the netns via inNetns, but
 		// a socket's netns membership is fixed at creation time — the

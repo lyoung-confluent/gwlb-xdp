@@ -51,8 +51,9 @@ VPC endpoint IDs can be in AWS's current 17-hex-digit form (`vpce-0123456789abcd
 | `setup` | `--allowed-origin-cidr` | *(required)* | Only accept GENEVE packets whose outer source IPv4 address is in this CIDR (the GWLB's subnet). Pass `0.0.0.0/0` to accept every origin. |
 | `setup` | `--max-enis` | `128` | Maximum number of VPC endpoints on this host. |
 | `setup` | `--max-flows` | `1048576` | Maximum number of tracked flows, IPv4 and IPv6 combined. |
-| `setup` | `--transparent` | `false` | Treat every endpoint as a transparent appliance (replies keep the request's 5-tuple rather than swapping it). |
+| `setup` | `--transparent` | `false` | Treat every endpoint as a transparent appliance (replies keep the request's 5-tuple rather than swapping it). Usually needs a larger `add --mtu`; see [MTU and offloads](#mtu-and-offloads). |
 | `add` | `--script` | | Executable run with the netns name and inner interface name as arguments, after the veth is up but before traffic can reach it. Use it to configure the backend side. |
+| `add` | `--mtu` | `8500` | MTU of the endpoint's veth pair, which caps what the backend both sends and receives. The default is GWLB's documented MTU, lowered to the uplink's limit (its MTU minus 68) if that's smaller. |
 | `add` | `--no-netns` | `false` | Keep the inner veth end in the root netns. Only safe if no two endpoints on the host have overlapping backend addresses. |
 | `serve` | `--listen` | `:6082` | Address for the HTTP health server. |
 | `serve` | `--statsd` | `127.0.0.1:8125` | statsd endpoint for counters (typically the local CloudWatch agent). |
@@ -62,15 +63,16 @@ VPC endpoint IDs can be in AWS's current 17-hex-digit form (`vpce-0123456789abcd
 
 ### Configuring the backend netns
 
-`add` creates the netns and veth but leaves addressing and routing to your `--script`. Besides the usual addresses and routes, the script needs to set **a route MTU of 8500**. GWLB silently drops replies larger than 8500 bytes and never sends ICMP "fragmentation needed". The veth's own MTU is larger than that (see [MTU details](#mtu-and-offloads)), so set the limit on the routes. For example:
+`add` creates the netns and veth but leaves addressing and routing to your `--script`. For example:
 
 ```sh
 #!/bin/sh
 # $1 = netns name, $2 = inner interface name
 ip -n "$1" addr add 10.0.0.2/24 dev "$2"
-ip -n "$1" route change 10.0.0.0/24 dev "$2" mtu 8500
-ip -n "$1" route add default via 10.0.0.1 dev "$2" mtu 8500
+ip -n "$1" route add default via 10.0.0.1 dev "$2"
 ```
+
+The default veth MTU of 8500 keeps replies within what GWLB will carry, so no route MTU is needed. This assumes the backend terminates connections (a NAT or proxy, say). A transparent appliance (`setup --transparent`) needs a larger `--mtu`; see [MTU and offloads](#mtu-and-offloads).
 
 ### Health and metrics
 
@@ -160,7 +162,7 @@ A reply too large to leave the uplink once encapsulated (larger than `max_inner_
 1. **Create a netns** for the endpoint, named after the VPC endpoint ID.
 2. **Create a veth pair** and move the inner end into the netns.
    - Names come from the ENI ID (`FormatInterfaceName` in [cmd/utils.go](cmd/utils.go)): `gxdp<id>` for the outer end and `gwlb<id>` for the inner end.
-   - MTU is the uplink's MTU minus GENEVE's 68 bytes (8933 on a 9001-byte uplink). That's the largest inner packet decap can deliver, and veth drops frames over the receiving end's MTU.
+   - MTU is `--mtu`, 8500 by default (see [MTU and offloads](#mtu-and-offloads)).
    - MACs are derived from the endpoint ID instead of being random (`FormatInterfaceMAC` in [cmd/utils.go](cmd/utils.go)): `02` for the outer end or `06` for the inner end, followed by the last 10 hex digits of the ID. For `vpce-0123456789abcdef0`, the inner end is `06:78:9a:bc:de:f0`. This makes them easy to spot in captures and stable across `remove`/`add`. Setting them explicitly also stops systemd-udevd's default `MACAddressPolicy=persistent` from replacing a random MAC after `add` has recorded it.
 3. **Turn ARP/ND off on the inner end** (`IFF_NOARP`). encap replaces the reply's whole Ethernet header, so the destination MAC the netns picks never reaches the wire. With ARP on, though, the netns's kernel would hold every reply until it resolved the next hop, and nothing would answer, because the root netns only answers for its own addresses. With ARP off, the kernel sends right away to the interface's own MAC, whatever the routes look like. Nothing needs to resolve the inner end either, since decap addresses every frame it delivers directly.
 4. **Disable offloads** on both ends: TX checksum offload and every segmentation and GRO offload (TSO, GSO, USO, GRO and so on; see `vethDisabledFeatures` in [cmd/add.go](cmd/add.go)). BPF can't compute the real L4 checksum, so the kernel has to write it before encap sees the packet. Every packet crossing the veth also has to be wire-sized, because encap would turn a GSO super-packet into one oversized frame that gets dropped.
@@ -203,8 +205,9 @@ Some settings are written into each program's `.rodata` at `setup` and are fixed
 
 ### MTU and offloads
 
-GWLB documents an MTU of 8500 bytes of inner packet but doesn't stick to it. It can deliver larger inner packets whole, and when it fragments a packet itself, the fragments can also exceed 8500. It never sends ICMP "fragmentation needed", so a DF-set reply larger than it will carry is lost silently. That makes the two directions different:
+GWLB documents an MTU of 8500 bytes of inner packet but doesn't stick to it. It can deliver larger inner packets whole, and when it fragments a packet itself, the fragments can also exceed 8500. It never sends ICMP "fragmentation needed", so a DF-set reply larger than it will carry is lost silently.
 
-- **Receiving uses the uplink's MTU minus 68.** decap delivers any inner packet that fits in one GENEVE packet on the uplink, and `add` sets each veth's MTU to the same value (8933 on a 9001-byte uplink). Both are read from the uplink when `setup` and `add` run, so re-run `setup` and re-add endpoints if the uplink's MTU changes. `setup` warns if the MTU is below 8568, the minimum that carries GWLB's documented 8500-byte packets.
-- **Sending uses a route MTU of 8500.** With `mtu 8500` on the netns's routes (see [Configuring the backend netns](#configuring-the-backend-netns)), the kernel picks a TCP MSS that fits (8460), fragments larger UDP datagrams itself (encap matches every fragment to its flow), and answers a forwarded DF-set packet that's too large with its own "fragmentation needed", which encap sends back to the sender. encap only enforces what the uplink can carry, so without the route MTU, replies of 8501–8933 bytes are sent and left for GWLB to carry or drop.
+- **The veth MTU is 8500 by default.** Replies from the netns are then sized to fit: the kernel picks a TCP MSS of 8460, fragments larger UDP datagrams itself (encap matches every fragment to its flow), and answers a DF-set packet that's too large with its own "fragmentation needed", which encap sends back to the sender.
+- **The same MTU limits what the netns receives.** veth drops any frame over the receiving end's MTU, so inner packets from GWLB larger than 8500 bytes are dropped at the veth, silently and after decap has counted them as delivered. A terminating backend doesn't see these, because its peers size their TCP segments to the MSS it advertises. A transparent appliance forwards traffic whose packet size was agreed with other hosts, so GWLB's larger packets and fragments would be lost at the default MTU.
+- **The uplink sets the upper limit.** decap and encap accept inner packets up to the uplink's MTU minus 68 (8933 on a 9001-byte uplink), read when `setup` runs, and `--mtu` can go up to the same value. Raising `--mtu` to it, as a transparent appliance needs, lets the netns receive everything GWLB delivers. Replies over 8500 bytes are then sent too, and left for GWLB to carry or drop, unless `--script` also sets a route MTU of 8500 (`ip -n "$1" route add default via <next hop> dev "$2" mtu 8500`). Re-run `setup` and re-add endpoints if the uplink's MTU changes. `setup` warns if the MTU is below 8568, the minimum that carries GWLB's documented 8500-byte packets.
 - **XDP runs in generic mode.** At a jumbo MTU, both ENA and veth refuse native XDP for single-buffer programs like these (no `xdp.frags`), so both programs normally run as generic XDP, after GRO. Keep UDP GRO forwarding (`rx-udp-gro-forwarding`, `rx-gro-list`) off on the uplink, or GENEVE packets can reach decap merged together. `setup` warns if either is on, and any merged packets that get through are counted as `decap_drop_oversize`.

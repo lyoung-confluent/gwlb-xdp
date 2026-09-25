@@ -23,19 +23,23 @@ var ScriptPath string
 // --no-netns
 var NoNetns bool
 
+// --mtu
+var VethMTU int
+
 // ./gwlb-xdp add
 var AddCmd = &cobra.Command{
 	Use:   "add <vpce-0000000aabbccddee>",
 	Short: "Provision one ENI on the fly",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return withStateLock(func() error { return RunAdd(args[0], ScriptPath, !NoNetns) })
+		return withStateLock(func() error { return RunAdd(args[0], ScriptPath, !NoNetns, VethMTU) })
 	},
 }
 
 func init() {
 	AddCmd.Flags().StringVar(&ScriptPath, "script", "", "run this executable after the veth (and netns, unless --no-netns) are up but before traffic can reach this ENI (see above)")
 	AddCmd.Flags().BoolVar(&NoNetns, "no-netns", false, "keep this ENI's veth pair in the root netns instead of a dedicated one — only safe when this ENI's backend addressing doesn't overlap any other ENI's on this box")
+	AddCmd.Flags().IntVar(&VethMTU, "mtu", 0, "MTU of this ENI's veth pair, capping both what the backend sends and what it can receive; at most the uplink's MTU minus 68 (default 8500, GWLB's documented MTU, or the uplink's limit if that's smaller)")
 	RootCmd.AddCommand(AddCmd)
 }
 
@@ -43,8 +47,9 @@ func init() {
 // moves into a dedicated netns named vpceID (the normal case); when not, it
 // stays alongside veth-outer in the root netns — only safe when no other ENI
 // on this box has overlapping backend addressing, since nothing then
-// separates their routing tables.
-func RunAdd(vpceID string, scriptPath string, isolated bool) (err error) {
+// separates their routing tables. mtu is the veth pair's MTU, or 0 for the
+// default: bpf.GWLBMTU, or the uplink's limit if that's smaller.
+func RunAdd(vpceID string, scriptPath string, isolated bool, mtu int) (err error) {
 	if scriptPath != "" {
 		if _, err := os.Stat(scriptPath); err != nil {
 			return fmt.Errorf("os.Stat for --script %q failed: %w", scriptPath, err)
@@ -63,11 +68,19 @@ func RunAdd(vpceID string, scriptPath string, isolated bool) (err error) {
 	outerName := FormatInterfaceName(gwlbID, false)
 	innerName := FormatInterfaceName(gwlbID, true)
 
-	// The veth's MTU comes from the uplink decap is attached to (see the
+	// The veth's MTU is capped by the uplink decap is attached to (see the
 	// LinkAdd below), so `setup` must already have run.
-	vethMTU, err := uplinkVethMTU()
+	maxMTU, err := uplinkVethMTU()
 	if err != nil {
 		return err
+	}
+	switch {
+	case mtu == 0:
+		mtu = min(bpf.GWLBMTU, maxMTU)
+	case mtu < 0:
+		return fmt.Errorf("--mtu %d is negative", mtu)
+	case mtu > maxMTU:
+		return fmt.Errorf("--mtu %d is over %d, the most one GENEVE packet on the uplink can carry", mtu, maxMTU)
 	}
 
 	// Refuse an ENI that's already provisioned before touching anything, so
@@ -139,12 +152,14 @@ func RunAdd(vpceID string, scriptPath string, isolated bool) (err error) {
 	}
 	defer nsh.Close()
 
-	// MTU vethMTU: the uplink's MTU minus GENEVE's 68 bytes, the largest
-	// inner packet decap delivers and encap sends (see bpf.MaxInnerLen). It
-	// has to be that large: veth drops a frame over the receiving end's MTU,
-	// and GWLB can deliver anything up to it. The netns sizes its own
-	// replies to GWLB's documented 8500 with a route MTU instead (see
-	// README.md) — the interface MTU governs what it can receive.
+	// MTU mtu, GWLB's documented 8500 by default: GWLB silently drops a
+	// larger reply, so the netns's stack must size its own traffic to fit
+	// (TCP MSS, fragmenting, "fragmentation needed"). The same MTU also caps
+	// what the netns can receive, since veth drops a frame over the
+	// receiving end's MTU — so a larger inner packet from GWLB, which it can
+	// send up to the uplink's limit (see bpf.MaxInnerLen), is dropped here.
+	// A terminating backend never sees one: its peers size their TCP
+	// segments to the MSS it advertises.
 	//
 	// Both ends get MACs derived from the ENI ID (see FormatInterfaceMAC)
 	// rather than the kernel's random ones, so they're recognizable and the
@@ -159,9 +174,9 @@ func RunAdd(vpceID string, scriptPath string, isolated bool) (err error) {
 	// root netns with no rename needed — isolated just additionally migrates
 	// the inner end into its dedicated netns afterwards.
 	if err := netlink.LinkAdd(&netlink.Veth{
-		LinkAttrs:        netlink.LinkAttrs{Name: outerName, MTU: vethMTU, HardwareAddr: FormatInterfaceMAC(gwlbID, false)},
+		LinkAttrs:        netlink.LinkAttrs{Name: outerName, MTU: mtu, HardwareAddr: FormatInterfaceMAC(gwlbID, false)},
 		PeerName:         innerName,
-		PeerMTU:          uint32(vethMTU),
+		PeerMTU:          uint32(mtu),
 		PeerHardwareAddr: FormatInterfaceMAC(gwlbID, true),
 	}); err != nil {
 		return fmt.Errorf("netlink.LinkAdd for veth pair %s/%s failed: %w", outerName, innerName, err)
@@ -267,7 +282,7 @@ func RunAdd(vpceID string, scriptPath string, isolated bool) (err error) {
 	return nil
 }
 
-// uplinkVethMTU returns the MTU for a new ENI's veth pair: bpf.MaxInnerLen of
+// uplinkVethMTU returns the largest MTU for a new ENI's veth pair: bpf.MaxInnerLen of
 // the MTU of the uplink decap is attached to. That's the same value `setup`
 // gave decap and encap, unless the uplink's MTU has changed since — in which
 // case re-run `setup`.

@@ -16,8 +16,8 @@ import (
 const PinDir = "/sys/fs/bpf/gwlb-xdp"
 
 // GWLBMTU is GWLB's documented MTU: the largest inner packet (IP header
-// onward) it's guaranteed to carry. It's what an ENI's netns should size its
-// own replies to, with a route MTU (see README.md) — GWLB sends no ICMP
+// onward) it's guaranteed to carry, and the default MTU of an ENI's veth
+// pair, so the netns sizes its own replies to it — GWLB sends no ICMP
 // "fragmentation needed", so a DF-set reply it won't carry is silently lost.
 // It is not a limit on what GWLB delivers: see MaxInnerLen.
 const GWLBMTU = 8500
@@ -33,9 +33,9 @@ const minInnerLen = 68
 
 // MaxInnerLen returns the largest inner packet (IP header onward) one GENEVE
 // packet on an uplink with this MTU can carry. It's decap's and encap's
-// max_inner_len and each ENI veth's MTU: GWLB doesn't hold what it delivers
-// to GWLBMTU (including fragments it creates itself), so the receive side
-// has to accept anything the uplink can carry.
+// max_inner_len and the most an ENI veth's MTU can be: GWLB doesn't hold
+// what it delivers to GWLBMTU (including fragments it creates itself), so
+// decap accepts anything the uplink can carry.
 func MaxInnerLen(uplinkMTU int) (int, error) {
 	n := uplinkMTU - GeneveOverhead
 	if n < minInnerLen {

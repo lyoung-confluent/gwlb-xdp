@@ -97,7 +97,7 @@ func TestAddAlreadyProvisioned(t *testing.T) {
 			fd := openGWLBSocket(t, gwlbIface)
 
 			for _, again := range []bool{isolated, !isolated} {
-				if err := cmd.RunAdd(vpceID, "", again); err == nil {
+				if err := cmd.RunAdd(vpceID, "", again, 0); err == nil {
 					t.Errorf("cmd.RunAdd(%q, isolated=%v) of a provisioned ENI succeeded, want an error", vpceID, again)
 				}
 			}
@@ -150,7 +150,7 @@ func TestAddRollback(t *testing.T) {
 			pinsBefore := encapPins(t)
 
 			failing := writeScript(t, "exit 1")
-			if err := cmd.RunAdd(cmd.FormatVPCEID(failingID), failing, isolated); err == nil {
+			if err := cmd.RunAdd(cmd.FormatVPCEID(failingID), failing, isolated, 0); err == nil {
 				t.Fatal("cmd.RunAdd with a failing --script succeeded, want an error")
 			}
 			assertNotProvisioned(t, failingID)
@@ -162,7 +162,7 @@ func TestAddRollback(t *testing.T) {
 
 			// Nothing left over to trip up a retry.
 			vpceID := cmd.FormatVPCEID(failingID)
-			if err := cmd.RunAdd(vpceID, "", isolated); err != nil {
+			if err := cmd.RunAdd(vpceID, "", isolated, 0); err != nil {
 				t.Fatalf("cmd.RunAdd(%q) after a rolled-back add failed: %v", vpceID, err)
 			}
 			if err := cmd.RunRemove(vpceID); err != nil {
@@ -189,7 +189,7 @@ func TestAddScriptSetsMAC(t *testing.T) {
 	uplinkIface, gwlbIface := setupUplink(t)
 	runSetup(t, 8)
 	script := writeScript(t, `exec ip -n "$1" link set dev "$2" address `+scriptMAC)
-	provisionENIWithScript(t, gwlbID, true, script, echoServerPort, func(b []byte) []byte { return b })
+	provisionENIWith(t, gwlbID, true, script, 0, echoServerPort, func(b []byte) []byte { return b })
 	fd := openGWLBSocket(t, gwlbIface)
 
 	info, err := decap.LookupENI(gwlbID)
@@ -202,4 +202,54 @@ func TestAddScriptSetsMAC(t *testing.T) {
 	}
 
 	assertRoundTrip(t, fd, uplinkIface, gwlbIface, gwlbID)
+}
+
+// TestAddMTU checks add's --mtu: both veth ends get GWLB's documented 8500 by
+// default or the given MTU otherwise, and one over what a GENEVE packet on
+// the uplink can carry is refused before anything is created.
+func TestAddMTU(t *testing.T) {
+	requireRoot(t)
+	_ = unix.Mount("bpf", "/sys/fs/bpf", "bpf", 0, "")
+
+	gwlbID := uint64(0xE2E)
+	vpceID := cmd.FormatVPCEID(gwlbID)
+
+	setupUplink(t)
+	runSetup(t, 8)
+
+	if err := cmd.RunAdd(vpceID, "", false, 9001-bpf.GeneveOverhead+1); err == nil {
+		t.Error("cmd.RunAdd with an --mtu over the uplink's limit succeeded, want an error")
+	}
+	assertNotProvisioned(t, gwlbID)
+
+	for _, tc := range []struct {
+		name string
+		mtu  int
+		want int
+	}{
+		{"default", 0, bpf.GWLBMTU},
+		{"explicit", 1500, 1500},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// --no-netns, so both ends can be looked up from here.
+			if err := cmd.RunAdd(vpceID, "", false, tc.mtu); err != nil {
+				t.Fatalf("cmd.RunAdd(%q, mtu=%d) failed: %v", vpceID, tc.mtu, err)
+			}
+			defer func() {
+				if err := cmd.RunRemove(vpceID); err != nil {
+					t.Fatalf("cmd.RunRemove(%q) failed: %v", vpceID, err)
+				}
+			}()
+			for _, inner := range []bool{false, true} {
+				name := cmd.FormatInterfaceName(gwlbID, inner)
+				iface, err := net.InterfaceByName(name)
+				if err != nil {
+					t.Fatalf("net.InterfaceByName(%q) failed: %v", name, err)
+				}
+				if iface.MTU != tc.want {
+					t.Errorf("%s MTU = %d, want %d", name, iface.MTU, tc.want)
+				}
+			}
+		})
+	}
 }
